@@ -1,0 +1,125 @@
+"""
+Application configuration management.
+Loads settings from .env, provides defaults, and exposes a typed Settings object.
+"""
+from __future__ import annotations
+
+import os
+import json
+from dataclasses import dataclass, field, asdict
+from pathlib import Path
+from typing import List
+
+from dotenv import load_dotenv
+
+APP_DIR = Path(__file__).resolve().parent
+ENV_PATH = APP_DIR / ".env"
+load_dotenv(ENV_PATH)
+
+DB_PATH_DEFAULT = str(APP_DIR / "tailsweeper.db")
+LOG_PATH_DEFAULT = str(APP_DIR / "tailsweeper.log")
+
+POLYMARKET_CLOB_BASE = "https://clob.polymarket.com"
+POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com"
+POLYMARKET_GEOBLOCK_URL = "https://clob.polymarket.com/auth/nonce"
+
+
+@dataclass
+class Settings:
+    """All user-tunable knobs live here."""
+
+    # mode
+    paper_mode: bool = True
+
+    # scan
+    scan_interval_sec: int = 60
+    max_entry_price: float = 0.005  # $0.005 = 0.5 cents
+    min_spread: float = 0.001
+    per_order_usd: float = 1.0
+    max_total_exposure: float = 50.0
+    max_positions: int = 50
+    max_buys_per_cycle: int = 3
+
+    # exit ladder (parallel lists)
+    exit_multiples: List[float] = field(default_factory=lambda: [3.0, 5.0, 10.0])
+    exit_fractions: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.25])
+
+    # filters
+    only_fee_free: bool = False
+    skip_neg_risk: bool = True
+    use_post_only: bool = True
+
+    # order management
+    stale_order_timeout_sec: int = 600
+    auto_cancel_on_stop: bool = True
+
+    # credentials (live mode)
+    private_key: str = ""
+    funder_address: str = ""
+    signature_type: int = 0  # 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
+
+    # paths
+    db_path: str = DB_PATH_DEFAULT
+    log_path: str = LOG_PATH_DEFAULT
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["exit_multiples"] = json.dumps(d["exit_multiples"])
+        d["exit_fractions"] = json.dumps(d["exit_fractions"])
+        return d
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "Settings":
+        if "exit_multiples" in d and isinstance(d["exit_multiples"], str):
+            d["exit_multiples"] = json.loads(d["exit_multiples"])
+        if "exit_fractions" in d and isinstance(d["exit_fractions"], str):
+            d["exit_fractions"] = json.loads(d["exit_fractions"])
+        bool_fields = [
+            "paper_mode", "only_fee_free", "skip_neg_risk",
+            "use_post_only", "auto_cancel_on_stop",
+        ]
+        int_fields = [
+            "scan_interval_sec", "max_positions", "max_buys_per_cycle",
+            "stale_order_timeout_sec", "signature_type",
+        ]
+        float_fields = [
+            "max_entry_price", "min_spread", "per_order_usd",
+            "max_total_exposure",
+        ]
+        for k in bool_fields:
+            if k in d and not isinstance(d[k], bool):
+                d[k] = str(d[k]).lower() in ("1", "true", "yes")
+        for k in int_fields:
+            if k in d and not isinstance(d[k], int):
+                try:
+                    d[k] = int(d[k])
+                except (ValueError, TypeError):
+                    pass
+        for k in float_fields:
+            if k in d and not isinstance(d[k], float):
+                try:
+                    d[k] = float(d[k])
+                except (ValueError, TypeError):
+                    pass
+        valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
+        filtered = {k: v for k, v in d.items() if k in valid_keys}
+        return cls(**filtered)
+
+    def load_env_credentials(self):
+        """Override credential fields from environment variables if set."""
+        self.private_key = os.getenv("POLYMARKET_PRIVATE_KEY", self.private_key)
+        self.funder_address = os.getenv("POLYMARKET_FUNDER_ADDRESS", self.funder_address)
+        sig = os.getenv("POLYMARKET_SIGNATURE_TYPE", "")
+        if sig.isdigit():
+            self.signature_type = int(sig)
+
+    def validate_live_mode(self) -> List[str]:
+        """Return list of validation errors for live mode. Empty = OK."""
+        errors = []
+        if not self.private_key:
+            errors.append("Private key is required for live trading")
+        if not self.funder_address:
+            errors.append("Funder address is required for live trading")
+        if self.max_total_exposure <= 0:
+            errors.append("Max total exposure must be > 0")
+        return errors
