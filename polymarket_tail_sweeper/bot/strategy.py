@@ -133,13 +133,17 @@ class Strategy:
 
     def should_enter(
         self,
-        current_exposure: float,
+        committed_capital: float,
         current_positions: int,
         buys_this_cycle: int,
     ) -> bool:
-        """Pre-flight checks before placing a buy."""
-        if current_exposure >= self.s.max_total_exposure:
-            logger.debug("Exposure cap reached: %.2f >= %.2f", current_exposure, self.s.max_total_exposure)
+        """
+        Pre-flight checks before placing a buy.
+        committed_capital = total_exposure + cash_reserved + in-cycle reserved.
+        """
+        if committed_capital >= self.s.max_total_exposure:
+            logger.debug("Committed capital cap: %.2f >= %.2f",
+                         committed_capital, self.s.max_total_exposure)
             return False
         if current_positions >= self.s.max_positions:
             logger.debug("Position cap reached: %d >= %d", current_positions, self.s.max_positions)

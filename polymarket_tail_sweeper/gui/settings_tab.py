@@ -139,6 +139,11 @@ class SettingsTab(QWidget):
         self.chk_auto_cancel = QCheckBox("Auto-cancel open orders on stop")
         order_layout.addWidget(self.chk_auto_cancel, 1, 0, 1, 2)
 
+        order_layout.addWidget(QLabel("Market refresh interval (sec):"), 2, 0)
+        self.spin_market_refresh = QSpinBox()
+        self.spin_market_refresh.setRange(60, 3600)
+        order_layout.addWidget(self.spin_market_refresh, 2, 1)
+
         main_layout.addWidget(order_group)
 
         # --- Credentials ---
@@ -207,6 +212,7 @@ class SettingsTab(QWidget):
         self.chk_post_only.setChecked(s.use_post_only)
         self.spin_stale_timeout.setValue(s.stale_order_timeout_sec)
         self.chk_auto_cancel.setChecked(s.auto_cancel_on_stop)
+        self.spin_market_refresh.setValue(s.market_refresh_interval_sec)
         self.edit_private_key.setText(s.private_key)
         self.edit_funder.setText(s.funder_address)
         self.combo_sig_type.setCurrentIndex(s.signature_type)
@@ -238,6 +244,7 @@ class SettingsTab(QWidget):
         s.use_post_only = self.chk_post_only.isChecked()
         s.stale_order_timeout_sec = self.spin_stale_timeout.value()
         s.auto_cancel_on_stop = self.chk_auto_cancel.isChecked()
+        s.market_refresh_interval_sec = self.spin_market_refresh.value()
         s.private_key = self.edit_private_key.text().strip()
         s.funder_address = self.edit_funder.text().strip()
         s.signature_type = self.combo_sig_type.currentIndex()
