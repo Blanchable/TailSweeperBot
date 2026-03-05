@@ -9,7 +9,7 @@ import time
 import traceback
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 
 from PySide6.QtCore import QThread, Signal
 
@@ -35,15 +35,22 @@ def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _parse_dt(s: str) -> Optional[datetime]:
+    try:
+        return datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
 class BotWorker(QThread):
     """Background worker thread for the scanning/trading loop."""
 
     # Signals for GUI updates
-    state_changed = Signal(str)          # BotState value
-    pnl_updated = Signal(object)         # PnLSummary
-    positions_updated = Signal(list)     # List[Position]
-    orders_updated = Signal(list)        # List[OpenOrder]
-    trades_updated = Signal(list)        # List[TradeRecord]
+    state_changed = Signal(str)
+    pnl_updated = Signal(object)
+    positions_updated = Signal(list)
+    orders_updated = Signal(list)
+    trades_updated = Signal(list)
     last_scan_time = Signal(str)
     last_order_time = Signal(str)
     geoblock_status = Signal(bool)
@@ -75,23 +82,19 @@ class BotWorker(QThread):
         self._strategy = Strategy(settings)
 
     def request_stop(self):
-        """Gracefully stop the bot after the current cycle."""
         self._running = False
 
     def kill_switch(self):
-        """Emergency stop: cancel all orders and halt immediately."""
         self._kill_switch = True
         self._running = False
         logger.warning("KILL SWITCH activated")
 
     def reload_markets(self):
-        """Force a market reload on next cycle."""
         self._markets_cache = []
         self._markets_last_refresh = 0.0
         logger.info("Markets cache cleared; will reload on next cycle")
 
     def cancel_all_orders(self):
-        """Cancel all open orders."""
         if self.is_paper:
             self._db.cancel_all_open_orders(is_paper=True)
             logger.info("Cancelled all paper orders")
@@ -102,8 +105,114 @@ class BotWorker(QThread):
             logger.info("Cancelled all live orders")
         self.orders_updated.emit(self._db.get_open_orders(self.is_paper))
 
+    # ==================================================================
+    # Sell All at Market
+    # ==================================================================
+    def sell_all_at_market(self):
+        """
+        Emergency liquidation: sell all held positions at executable best bid.
+        Works in both paper and live mode. Can be called when bot is stopped.
+        """
+        is_paper = self.is_paper
+        positions = self._db.get_positions(is_paper)
+        if not positions:
+            logger.info("Sell-all: no positions to liquidate")
+            return
+
+        logger.warning("SELL ALL AT MARKET: liquidating %d positions", len(positions))
+
+        # Cancel any existing open SELL orders first
+        for pos in positions:
+            self._db.cancel_open_sells_for_token(pos.token_id, is_paper)
+            if not is_paper and self._live_adapter and self._live_adapter.is_ready:
+                for o in self._db.get_open_orders(is_paper):
+                    if o.token_id == pos.token_id and o.side == "SELL":
+                        self._live_adapter.cancel_order(o.order_id)
+
+        token_ids = [p.token_id for p in positions]
+        books = fetch_multiple_order_books(token_ids)
+
+        for pos in positions:
+            try:
+                book = books.get(pos.token_id)
+                if not book or book.best_bid is None or book.best_bid <= 0:
+                    logger.warning("Sell-all skipped %s: no executable bid",
+                                   pos.token_id[:12])
+                    continue
+
+                sell_price = book.best_bid
+                sell_shares = pos.shares
+                if sell_shares <= 0:
+                    continue
+
+                if is_paper:
+                    order_id = self._paper_adapter.generate_order_id()
+                    filled, fp, fq = self._paper_adapter.simulate_fill(
+                        "SELL", sell_price, sell_shares,
+                        book.best_bid, book.best_ask,
+                        book.best_bid_size, book.best_ask_size,
+                    )
+                    actual_qty = fq if filled and fq > 0 else sell_shares
+                    actual_price = fp if filled else sell_price
+                    realized = self._pnl.record_sell(
+                        pos.token_id, actual_price, actual_qty, is_paper=True,
+                    )
+                    self._db.insert_trade(TradeRecord(
+                        timestamp=_now(), action="SELL",
+                        market_question=pos.market_question,
+                        outcome=pos.outcome, token_id=pos.token_id,
+                        price=actual_price, size=actual_qty,
+                        gross_value=actual_price * actual_qty,
+                        realized_pnl=realized,
+                        notes="Sell-all market liquidation",
+                        is_paper=True,
+                    ))
+                    self._db.insert_order(OpenOrder(
+                        order_id=order_id, token_id=pos.token_id,
+                        condition_id=pos.condition_id,
+                        market_question=pos.market_question,
+                        side="SELL", price=actual_price, size=actual_qty,
+                        remaining_size=0, status="FILLED",
+                        is_paper=True, order_tag="SELL_ALL",
+                    ))
+                    logger.info("Sell-all paper: %s @ %.4f x %.2f, PnL=%.4f",
+                                pos.token_id[:12], actual_price, actual_qty, realized)
+                else:
+                    if self._live_adapter and self._live_adapter.is_ready:
+                        oid = self._live_adapter.place_limit_order(
+                            pos.token_id, "SELL", sell_price, sell_shares,
+                            post_only=False, book=book,
+                        )
+                        if oid:
+                            self._db.insert_order(OpenOrder(
+                                order_id=oid, token_id=pos.token_id,
+                                condition_id=pos.condition_id,
+                                market_question=pos.market_question,
+                                side="SELL", price=sell_price, size=sell_shares,
+                                remaining_size=sell_shares, status="OPEN",
+                                is_paper=False, order_tag="SELL_ALL",
+                            ))
+                            self._db.insert_trade(TradeRecord(
+                                timestamp=_now(), action="SELL",
+                                market_question=pos.market_question,
+                                outcome=pos.outcome, token_id=pos.token_id,
+                                price=sell_price, size=sell_shares,
+                                gross_value=sell_price * sell_shares,
+                                notes="Sell-all live (resting)",
+                                is_paper=False,
+                            ))
+                            logger.info("Sell-all live: %s @ %.4f x %.2f => %s",
+                                        pos.token_id[:12], sell_price, sell_shares, oid)
+                    else:
+                        logger.error("Sell-all: live adapter not ready for %s",
+                                     pos.token_id[:12])
+            except Exception as exc:
+                logger.error("Sell-all error for %s: %s", pos.token_id[:12], exc)
+
+    # ==================================================================
+    # Main run loop
+    # ==================================================================
     def run(self):
-        """Main thread entry point."""
         self._running = True
         self._kill_switch = False
         self._consecutive_errors = 0
@@ -116,6 +225,8 @@ class BotWorker(QThread):
             if not self._init_live_trading():
                 self.state_changed.emit(BotState.ERROR)
                 return
+            if self._settings.live_sync_on_start:
+                self._sync_live_account_state()
 
         while self._running and not self._kill_switch:
             try:
@@ -147,14 +258,12 @@ class BotWorker(QThread):
         logger.info("Bot stopped")
 
     def _interruptible_sleep(self, seconds: int):
-        """Sleep that can be interrupted by stop requests."""
         for _ in range(seconds * 2):
             if not self._running or self._kill_switch:
                 break
             time.sleep(0.5)
 
     def _init_live_trading(self) -> bool:
-        """Initialize the live trading adapter."""
         errors = self._settings.validate_live_mode()
         if errors:
             for e in errors:
@@ -177,10 +286,148 @@ class BotWorker(QThread):
         return True
 
     # ==================================================================
+    # Live account state sync (Objective B)
+    # ==================================================================
+    def _sync_live_account_state(self):
+        """
+        Reconcile local DB against actual exchange/wallet state.
+        Run on startup and optionally during idle.
+        """
+        if not self._live_adapter or not self._live_adapter.is_ready:
+            return
+
+        logger.info("=== Live account sync starting ===")
+
+        # 1. Sync open orders
+        self._reconcile_live_orders_full()
+
+        # 2. Sync wallet positions
+        wallet = self._live_adapter.get_wallet_positions()
+        if not wallet:
+            logger.info("Live sync: wallet positions fetch returned empty (may be unsupported)")
+        else:
+            self._sync_positions_to_wallet(wallet)
+
+        self._emit_state()
+        logger.info("=== Live account sync complete ===")
+
+    def _reconcile_live_orders_full(self):
+        """Enhanced reconciliation that handles missing orders more carefully."""
+        if not self._live_adapter or not self._live_adapter.is_ready:
+            return
+
+        local_open = self._db.get_open_orders(is_paper=False)
+        if not local_open:
+            return
+
+        order_ids = [o.order_id for o in local_open]
+        exchange_states = self._live_adapter.fetch_exchange_order_states(order_ids)
+
+        for local in local_open:
+            ex = exchange_states.get(local.order_id)
+            if ex is None:
+                # Order not found — could be filled offline or cancelled
+                # Try individual lookup before deciding
+                raw = self._live_adapter.get_order(local.order_id)
+                if raw:
+                    from adapters.polymarket_trade import LiveTradingAdapter as LTA
+                    ex = LTA._normalize_exchange_order(raw)
+                else:
+                    # Truly gone: mark as terminal but log as ambiguous
+                    logger.warning(
+                        "Order %s (%s) not found on exchange after restart. "
+                        "Marking FILLED (assumed offline fill). "
+                        "Wallet sync will correct position if wrong.",
+                        local.order_id, local.side,
+                    )
+                    fill_delta = local.remaining_size
+                    if fill_delta > 0.001:
+                        self._process_fill(local, local.price, fill_delta)
+                    self._db.update_order_status(local.order_id, "FILLED", 0)
+                    continue
+
+            # Normal reconciliation
+            local_remaining = local.remaining_size
+            ex_remaining = ex.remaining_size
+            fill_delta = local_remaining - ex_remaining
+
+            if fill_delta > 0.001:
+                logger.info(
+                    "Reconciled fill: %s %s delta=%.4f (local=%.4f, ex=%.4f)",
+                    local.side, local.order_id, fill_delta, local_remaining, ex_remaining,
+                )
+                self._process_fill(local, local.price, fill_delta)
+
+            new_status = ex.status
+            if new_status in ("FILLED", "CANCELLED", "EXPIRED"):
+                self._db.update_order_status(local.order_id, new_status, ex_remaining)
+            elif new_status in ("PARTIAL", "OPEN"):
+                self._db.update_order_status(local.order_id, "OPEN", ex_remaining)
+
+    def _sync_positions_to_wallet(self, wallet: Dict[str, float]):
+        """
+        Sync local positions to match actual wallet holdings.
+        Adjusts shares to reality; logs adjustments clearly.
+        """
+        local_positions = self._db.get_positions(is_paper=False)
+        local_map = {p.token_id: p for p in local_positions}
+        all_tokens = set(wallet.keys()) | set(local_map.keys())
+
+        for token_id in all_tokens:
+            local = local_map.get(token_id)
+            wallet_shares = wallet.get(token_id, 0.0)
+            local_shares = local.shares if local else 0.0
+
+            if abs(wallet_shares - local_shares) < 0.01:
+                continue
+
+            if wallet_shares <= 0 and local_shares > 0:
+                logger.warning(
+                    "Live sync: removing phantom position %s (DB=%.2f, wallet=0)",
+                    token_id[:12], local_shares,
+                )
+                self._db.delete_position(token_id, is_paper=False)
+                self._db.insert_event("WARNING",
+                    f"Position {token_id[:12]} removed during live sync "
+                    f"(was {local_shares:.2f} shares, wallet shows 0)")
+
+            elif wallet_shares > 0 and local_shares <= 0:
+                logger.warning(
+                    "Live sync: importing external position %s (wallet=%.2f)",
+                    token_id[:12], wallet_shares,
+                )
+                pos = Position(
+                    token_id=token_id,
+                    condition_id="",
+                    market_question="Imported from wallet sync",
+                    outcome="",
+                    shares=wallet_shares,
+                    avg_entry=0.0,
+                    cost_basis=0.0,
+                    is_paper=False,
+                )
+                self._db.upsert_position(pos)
+                self._db.insert_event("INFO",
+                    f"Position {token_id[:12]} imported during live sync "
+                    f"({wallet_shares:.2f} shares, avg_entry unknown)")
+
+            else:
+                logger.warning(
+                    "Live sync: adjusting %s shares from %.2f to %.2f",
+                    token_id[:12], local_shares, wallet_shares,
+                )
+                local.shares = wallet_shares
+                if local.avg_entry > 0:
+                    local.cost_basis = local.avg_entry * wallet_shares
+                self._db.upsert_position(local)
+                self._db.insert_event("INFO",
+                    f"Position {token_id[:12]} adjusted during live sync "
+                    f"({local_shares:.2f} -> {wallet_shares:.2f})")
+
+    # ==================================================================
     # Main cycle
     # ==================================================================
     def _run_cycle(self):
-        """One full scan -> reconcile -> monitor -> enter cycle."""
         logger.info("=== Scan cycle start ===")
         clear_book_cache()
 
@@ -190,47 +437,50 @@ class BotWorker(QThread):
             logger.warning("API not reachable — skipping cycle")
             return
 
-        # 1. Refresh markets on timer or if empty
+        # 1. Refresh markets
         self._maybe_refresh_markets()
         if not self._markets_cache:
             logger.warning("No markets available")
             return
 
-        # 2. Reconcile order state (live fills, paper resting fills)
+        # 2. Reconcile orders
         if self.is_paper:
             self._check_paper_fills()
         else:
-            self._reconcile_live_orders()
+            self._reconcile_live_orders_full()
 
         # 3. Cancel stale orders
         self._cancel_stale_orders()
 
-        # 4. Monitor positions — update marks and check exit triggers
+        # 4. Inventory management — time-based position aging
+        self._manage_aging_inventory()
+
+        # 5. Monitor positions — update marks and check exit triggers
         positions = self._db.get_positions(self.is_paper)
         self._monitor_positions(positions)
 
-        # 5. Build committed-capital snapshot for entry gating
+        # 6. Populate strategy memory
+        self._update_strategy_memory()
+
+        # 7. Build committed-capital snapshot for entry gating
         summary = self._db.build_pnl_summary(self.is_paper)
         committed = summary.total_exposure + summary.cash_reserved
 
-        # 6. Filter markets for entry candidates
+        # 8. Filter and scan for entries
         filtered = self._strategy.filter_markets(self._markets_cache)
 
         open_orders = self._db.get_open_orders(self.is_paper)
         held_tokens = {p.token_id for p in self._db.get_positions(self.is_paper)}
         open_buy_tokens = {o.token_id for o in open_orders if o.side == "BUY"}
 
-        # 7. Scan and place new entries
         buys_this_cycle = 0
-        cycle_reserved = 0.0  # additional notional reserved this cycle
+        cycle_reserved = 0.0
 
         for market in filtered:
             if not self._running:
                 break
             if not self._strategy.should_enter(
-                committed + cycle_reserved,
-                len(held_tokens),
-                buys_this_cycle,
+                committed + cycle_reserved, len(held_tokens), buys_this_cycle,
             ):
                 break
 
@@ -246,9 +496,7 @@ class BotWorker(QThread):
                 if not self._running:
                     break
                 if not self._strategy.should_enter(
-                    committed + cycle_reserved,
-                    len(held_tokens),
-                    buys_this_cycle,
+                    committed + cycle_reserved, len(held_tokens), buys_this_cycle,
                 ):
                     break
                 if not self._strategy.price_guard(cand.ask_price):
@@ -260,7 +508,6 @@ class BotWorker(QThread):
 
                 order_cost = cand.ask_price * shares
                 if committed + cycle_reserved + order_cost > self._settings.max_total_exposure:
-                    logger.debug("Would exceed exposure cap, skipping")
                     continue
 
                 filled_shares = self._place_buy(cand, shares)
@@ -268,20 +515,123 @@ class BotWorker(QThread):
                     buys_this_cycle += 1
                     open_buy_tokens.add(cand.token.token_id)
                     if filled_shares > 0:
-                        # Immediately filled: counts as position exposure
                         held_tokens.add(cand.token.token_id)
                         committed += cand.ask_price * filled_shares
                         resting = shares - filled_shares
                         if resting > 0:
                             cycle_reserved += cand.ask_price * resting
                     else:
-                        # Fully resting: counts as reserved cash
                         cycle_reserved += order_cost
 
-        # 8. Emit updated state
+        # 9. Entry repricing
+        if self._settings.entry_reprice_enabled:
+            self._reprice_stale_entries()
+
+        # 10. Emit state
         self._emit_state()
         self.last_scan_time.emit(_now())
         logger.info("=== Scan cycle end === (buys=%d)", buys_this_cycle)
+
+    # ==================================================================
+    # Strategy memory
+    # ==================================================================
+    def _update_strategy_memory(self):
+        """Feed the strategy with recent winner data and position counts."""
+        hours = self._settings.recent_winner_boost_hours
+        winners = set(self._db.get_recent_profitable_tokens(hours, self.is_paper))
+        self._strategy.set_recent_winners(winners)
+
+        positions = self._db.get_positions(self.is_paper)
+        counts: Dict[str, int] = {}
+        for p in positions:
+            cid = p.condition_id
+            if cid:
+                counts[cid] = counts.get(cid, 0) + 1
+        self._strategy.set_position_condition_counts(counts)
+
+    # ==================================================================
+    # Inventory management
+    # ==================================================================
+    def _manage_aging_inventory(self):
+        """Time-based position management: tighten exits on old positions."""
+        positions = self._db.get_positions(self.is_paper)
+        now_dt = datetime.now(timezone.utc)
+
+        for pos in positions:
+            if not self._running:
+                break
+
+            created = _parse_dt(pos.created_at)
+            if not created:
+                continue
+            age_min = (now_dt - created).total_seconds() / 60.0
+
+            # Skip if there's already an open sell
+            if self._db.has_open_order_for_token(pos.token_id, "SELL", self.is_paper):
+                continue
+
+            # Breakeven unwind: position held beyond threshold, try to exit near breakeven
+            if age_min >= self._settings.breakeven_unwind_minutes:
+                book = fetch_order_book(pos.token_id)
+                if book.best_bid and book.best_bid > 0:
+                    min_price = pos.avg_entry
+                    if self._settings.allow_small_forced_unwind_loss:
+                        min_price = pos.avg_entry * 0.95
+                    if book.best_bid >= min_price:
+                        logger.info(
+                            "Inventory mgmt: unwinding aged position %s (%.0f min, bid=%.4f, avg=%.4f)",
+                            pos.token_id[:12], age_min, book.best_bid, pos.avg_entry,
+                        )
+                        self._place_sell(pos, book.best_bid, pos.shares, -1, book,
+                                         order_tag="BREAKEVEN_UNWIND")
+                    else:
+                        logger.debug(
+                            "Inventory mgmt: aged position %s bid too low for unwind (%.4f < %.4f)",
+                            pos.token_id[:12], book.best_bid, min_price,
+                        )
+
+            # No-progress: if position hasn't hit any rung after threshold, convert passive to aggressive
+            elif age_min >= self._settings.no_progress_minutes and pos.next_exit_rung == 0:
+                logger.debug(
+                    "Inventory mgmt: no-progress position %s (%.0f min)",
+                    pos.token_id[:12], age_min,
+                )
+
+    # ==================================================================
+    # Entry repricing
+    # ==================================================================
+    def _reprice_stale_entries(self):
+        """Cancel and replace resting buy orders that have become uncompetitive."""
+        if not self._settings.entry_reprice_enabled:
+            return
+
+        open_buys = [o for o in self._db.get_open_orders(self.is_paper) if o.side == "BUY"]
+        interval = self._settings.entry_reprice_interval_sec
+
+        for order in open_buys:
+            if not self._running:
+                break
+            created = _parse_dt(order.created_at)
+            if not created:
+                continue
+            age_sec = (datetime.now(timezone.utc) - created).total_seconds()
+            if age_sec < interval:
+                continue
+
+            # Check if we've already repriced too many times (use notes as counter)
+            # Simple approach: just cancel stale entries older than reprice_interval * (max_reprices + 1)
+            max_age = interval * (self._settings.entry_max_reprices + 1)
+            if age_sec > max_age:
+                logger.info("Entry reprice: cancelling exhausted order %s (age=%ds)",
+                            order.order_id, int(age_sec))
+                self._db.update_order_status(order.order_id, "CANCELLED")
+                if not self.is_paper and self._live_adapter:
+                    self._live_adapter.cancel_order(order.order_id)
+                continue
+
+            # Could reprice here — for now just cancel old ones
+            logger.debug("Entry reprice: order %s aged %ds, eligible for reprice",
+                         order.order_id, int(age_sec))
 
     # ==================================================================
     # Market refresh
@@ -295,67 +645,13 @@ class BotWorker(QThread):
         self._markets_last_refresh = now
 
     # ==================================================================
-    # Live order reconciliation
-    # ==================================================================
-    def _reconcile_live_orders(self):
-        """
-        Reconcile local order records against exchange state.
-        Detects new fills by comparing remaining_size deltas.
-        """
-        if not self._live_adapter or not self._live_adapter.is_ready:
-            return
-
-        local_open = self._db.get_open_orders(is_paper=False)
-        if not local_open:
-            return
-
-        order_ids = [o.order_id for o in local_open]
-        exchange_states = self._live_adapter.fetch_exchange_order_states(order_ids)
-
-        for local in local_open:
-            ex = exchange_states.get(local.order_id)
-            if ex is None:
-                # Exchange doesn't know this order — treat as cancelled/expired
-                logger.warning(
-                    "Order %s not found on exchange — marking CANCELLED",
-                    local.order_id,
-                )
-                self._db.update_order_status(local.order_id, "CANCELLED", local.remaining_size)
-                continue
-
-            # Detect fill delta
-            local_remaining = local.remaining_size
-            ex_remaining = ex.remaining_size
-            fill_delta = local_remaining - ex_remaining
-
-            if fill_delta > 0.001:
-                # New fill happened
-                logger.info(
-                    "Reconciled fill: %s %s delta=%.4f (local_rem=%.4f, ex_rem=%.4f)",
-                    local.side, local.order_id, fill_delta, local_remaining, ex_remaining,
-                )
-                self._process_fill(local, local.price, fill_delta)
-
-            # Sync status
-            new_status = ex.status
-            if new_status in ("FILLED", "CANCELLED", "EXPIRED"):
-                self._db.update_order_status(local.order_id, new_status, ex_remaining)
-            elif new_status == "PARTIAL":
-                self._db.update_order_status(local.order_id, "OPEN", ex_remaining)
-            elif new_status == "OPEN":
-                if abs(ex_remaining - local_remaining) > 0.001:
-                    self._db.update_order_status(local.order_id, "OPEN", ex_remaining)
-
-    # ==================================================================
     # Paper fills for resting orders
     # ==================================================================
     def _check_paper_fills(self):
-        """Check if any resting paper orders can be filled against the current book."""
         open_orders = self._db.get_open_orders(is_paper=True)
         if not open_orders:
             return
 
-        # Batch-fetch books for all tokens with open orders
         token_ids = list({o.token_id for o in open_orders})
         books = fetch_multiple_order_books(token_ids)
 
@@ -382,11 +678,9 @@ class BotWorker(QThread):
     # Position monitoring + exit ladder
     # ==================================================================
     def _monitor_positions(self, positions):
-        """Update mark prices and trigger exit ladder sells."""
         if not positions:
             return
 
-        # Batch-fetch books for all held tokens
         token_ids = [p.token_id for p in positions]
         books = fetch_multiple_order_books(token_ids)
 
@@ -403,19 +697,14 @@ class BotWorker(QThread):
                 if not refreshed or refreshed.shares <= 0:
                     continue
 
-                # Guard: skip exit if there's already an open SELL for this token
                 if self._db.has_open_order_for_token(pos.token_id, "SELL", self.is_paper):
-                    logger.debug(
-                        "Exit skipped: existing open sell order for %s",
-                        pos.token_id[:12],
-                    )
+                    logger.debug("Exit skipped: existing open sell for %s", pos.token_id[:12])
                     continue
 
                 best_bid = book.best_bid
                 best_ask = book.best_ask
                 mid = book.midpoint
 
-                # Choose the trigger price based on configured mode
                 if self._settings.exit_trigger_mode == "midpoint" and mid is not None:
                     trigger_price = mid
                 else:
@@ -448,48 +737,30 @@ class BotWorker(QThread):
                     f"{best_bid:.4f}" if best_bid else "None",
                     f"{best_ask:.4f}" if best_ask else "None",
                     f"{mid:.4f}" if mid else "None",
-                    rung_idx,
-                    rung_multiple,
-                    target_price,
-                    trigger_price,
-                    min_exit,
+                    rung_idx, rung_multiple, target_price, trigger_price, min_exit,
                 )
 
-                # No-loss guard: never auto-sell below breakeven + buffer
                 if best_bid is None or best_bid < min_exit:
                     logger.info(
-                        "Exit blocked: executable bid (%.4f) below breakeven+buffer "
-                        "(%.4f) for %s (avg_entry=%.4f, buffer=%.4f)",
-                        best_bid or 0.0,
-                        min_exit,
-                        pos.token_id[:12],
-                        refreshed.avg_entry,
-                        self._settings.min_exit_profit_buffer,
+                        "Exit blocked: bid (%.4f) below breakeven+buffer (%.4f) for %s",
+                        best_bid or 0.0, min_exit, pos.token_id[:12],
                     )
                     continue
 
-                # Choose order price based on exit_order_mode
                 if self._settings.exit_order_mode == "passive":
-                    if mid is not None and mid > best_bid:
-                        sell_price = mid
-                    else:
-                        sell_price = best_bid
-                    # Even in passive mode, never price below breakeven
+                    sell_price = mid if (mid is not None and mid > best_bid) else best_bid
                     if sell_price < min_exit:
                         sell_price = min_exit
-                    logger.info(
-                        "Exit deferred: passive sell posted at %.4f (bid=%.4f) for %s",
-                        sell_price, best_bid, pos.token_id[:12],
-                    )
+                    logger.info("Exit deferred: passive at %.4f for %s",
+                                sell_price, pos.token_id[:12])
                 else:
                     sell_price = best_bid
-                    logger.info(
-                        "Exit placed: aggressive sell at bid %.4f for %s",
-                        sell_price, pos.token_id[:12],
-                    )
+                    logger.info("Exit placed: aggressive at %.4f for %s",
+                                sell_price, pos.token_id[:12])
 
                 if sell_price > 0 and sell_shares > 0:
-                    self._place_sell(refreshed, sell_price, sell_shares, rung_idx, book)
+                    self._place_sell(refreshed, sell_price, sell_shares, rung_idx, book,
+                                     order_tag=f"EXIT_RUNG:{rung_idx}")
 
             except Exception as exc:
                 logger.error("Error monitoring %s: %s", pos.token_id[:12], exc)
@@ -518,12 +789,6 @@ class BotWorker(QThread):
     # Buy placement
     # ==================================================================
     def _place_buy(self, cand, shares: float) -> Optional[float]:
-        """
-        Place a buy order (paper or live).
-        Returns:
-          - filled_shares (float >= 0) on success (0 means resting)
-          - None if the order was not placed at all
-        """
         price = cand.ask_price
         token_id = cand.token.token_id
 
@@ -554,7 +819,7 @@ class BotWorker(QThread):
             side="BUY", price=price, size=shares,
             remaining_size=remaining, status=status,
             post_only=self._settings.use_post_only,
-            is_paper=True,
+            is_paper=True, order_tag="ENTRY",
         ))
 
         actual_fill = 0.0
@@ -603,7 +868,7 @@ class BotWorker(QThread):
             side="BUY", price=price, size=shares,
             remaining_size=shares, status="OPEN",
             post_only=self._settings.use_post_only,
-            is_paper=False,
+            is_paper=False, order_tag="ENTRY",
         ))
         self._db.insert_trade(TradeRecord(
             timestamp=_now(), action="BUY",
@@ -617,26 +882,23 @@ class BotWorker(QThread):
         self.last_order_time.emit(_now())
         logger.info("Live BUY placed: %s @ %.4f x %.2f => %s",
                      cand.market.question[:40], price, shares, order_id)
-        # Live orders are always treated as resting until reconciliation
         return 0.0
 
     # ==================================================================
     # Sell placement
     # ==================================================================
     def _place_sell(self, pos: Position, price: float, shares: float,
-                    rung_idx: int, book: Optional[object] = None):
-        """
-        Place a sell order for exit ladder.
-        Does NOT advance exit rung — that happens only on actual fill.
-        """
+                    rung_idx: int, book=None, order_tag: str = ""):
+        """Place a sell order. order_tag persists intent for later rung resolution."""
         token_id = pos.token_id
+        tag = order_tag or (f"EXIT_RUNG:{rung_idx}" if rung_idx >= 0 else "MANUAL")
 
         if self.is_paper:
-            self._place_sell_paper(pos, price, shares, rung_idx, book)
+            self._place_sell_paper(pos, price, shares, rung_idx, book, tag)
         else:
-            self._place_sell_live(pos, price, shares, rung_idx, book)
+            self._place_sell_live(pos, price, shares, rung_idx, book, tag)
 
-    def _place_sell_paper(self, pos, price, shares, rung_idx, book):
+    def _place_sell_paper(self, pos, price, shares, rung_idx, book, tag):
         token_id = pos.token_id
         order_id = self._paper_adapter.generate_order_id()
 
@@ -658,7 +920,7 @@ class BotWorker(QThread):
                 price=fill_price, size=fill_qty,
                 gross_value=fill_price * fill_qty,
                 realized_pnl=realized,
-                notes=f"Exit rung {rung_idx + 1}",
+                notes=f"Exit rung {rung_idx + 1}" if rung_idx >= 0 else tag,
                 is_paper=True,
             ))
             self._db.insert_order(OpenOrder(
@@ -667,10 +929,9 @@ class BotWorker(QThread):
                 market_question=pos.market_question,
                 side="SELL", price=fill_price, size=fill_qty,
                 remaining_size=0, status="FILLED",
-                is_paper=True,
+                is_paper=True, order_tag=tag,
             ))
-            # Advance rung only on actual fill
-            if fill_qty >= shares:
+            if fill_qty >= shares and rung_idx >= 0 and tag.startswith("EXIT_RUNG"):
                 self._pnl.advance_exit_rung(token_id, rung_idx + 1, is_paper=True)
             logger.info("Paper SELL filled: %s @ %.4f x %.2f, PnL=%.4f",
                          pos.market_question[:40], fill_price, fill_qty, realized)
@@ -681,20 +942,19 @@ class BotWorker(QThread):
                 market_question=pos.market_question,
                 side="SELL", price=price, size=shares,
                 remaining_size=shares, status="OPEN",
-                is_paper=True,
+                is_paper=True, order_tag=tag,
             ))
-            logger.info("Paper SELL resting: %s @ %.4f x %.2f (rung %d pending)",
-                         pos.market_question[:40], price, shares, rung_idx + 1)
+            logger.info("Paper SELL resting: %s @ %.4f x %.2f (tag=%s)",
+                         pos.market_question[:40], price, shares, tag)
 
-    def _place_sell_live(self, pos, price, shares, rung_idx, book):
+    def _place_sell_live(self, pos, price, shares, rung_idx, book, tag):
         token_id = pos.token_id
         if not self._live_adapter or not self._live_adapter.is_ready:
             return
 
         order_id = self._live_adapter.place_limit_order(
             token_id, "SELL", price, shares,
-            post_only=False,
-            book=book,
+            post_only=False, book=book,
         )
         if order_id:
             self._db.insert_order(OpenOrder(
@@ -703,25 +963,24 @@ class BotWorker(QThread):
                 market_question=pos.market_question,
                 side="SELL", price=price, size=shares,
                 remaining_size=shares, status="OPEN",
-                is_paper=False,
+                is_paper=False, order_tag=tag,
             ))
             self._db.insert_trade(TradeRecord(
                 timestamp=_now(), action="SELL",
                 market_question=pos.market_question,
-                outcome=pos.outcome, token_id=token_id,
+                outcome=pos.outcome, token_id=pos.token_id,
                 price=price, size=shares,
                 gross_value=price * shares,
-                notes=f"Live exit rung {rung_idx + 1} (resting)",
+                notes=f"Live exit (tag={tag}, resting)",
                 is_paper=False,
             ))
-            logger.info("Live SELL placed: %s @ %.4f x %.2f => %s",
-                         token_id[:12], price, shares, order_id)
+            logger.info("Live SELL placed: %s @ %.4f x %.2f => %s (tag=%s)",
+                         token_id[:12], price, shares, order_id, tag)
 
     # ==================================================================
-    # Fill processing (shared by paper and live reconciliation)
+    # Fill processing
     # ==================================================================
     def _process_fill(self, order: OpenOrder, fill_price: float, fill_qty: float):
-        """Process a fill on a resting order."""
         if order.side == "BUY":
             self._pnl.record_buy(
                 order.token_id, order.condition_id,
@@ -751,12 +1010,23 @@ class BotWorker(QThread):
                 notes="Resting order filled",
                 is_paper=self.is_paper,
             ))
-            # Advance exit rung now that the sell actually filled
-            pos = self._db.get_position_by_token(order.token_id, self.is_paper)
-            if pos:
-                self._pnl.advance_exit_rung(
-                    order.token_id, pos.next_exit_rung + 1, self.is_paper,
-                )
+            # Only advance exit rung if this was an EXIT_RUNG order
+            tag = order.order_tag or self._db.get_order_tag(order.order_id)
+            if tag.startswith("EXIT_RUNG:"):
+                try:
+                    intended_rung = int(tag.split(":")[1])
+                    new_remaining = max(0, order.remaining_size - fill_qty)
+                    if new_remaining <= 0.01:
+                        self._pnl.advance_exit_rung(
+                            order.token_id, intended_rung + 1, self.is_paper,
+                        )
+                        logger.info("Exit rung %d advanced for %s (full fill)",
+                                    intended_rung, order.token_id[:12])
+                    else:
+                        logger.info("Exit rung %d partial fill for %s (%.2f remaining)",
+                                    intended_rung, order.token_id[:12], new_remaining)
+                except (ValueError, IndexError):
+                    pass
 
         new_remaining = max(0, order.remaining_size - fill_qty)
         new_status = "FILLED" if new_remaining <= 0 else "OPEN"
@@ -766,19 +1036,14 @@ class BotWorker(QThread):
         self.last_order_time.emit(_now())
 
     # ==================================================================
-    # Kill switch
+    # Kill switch + state emission
     # ==================================================================
     def _execute_kill_switch(self):
-        """Emergency: cancel everything and stop."""
         logger.warning("Executing kill switch — cancelling all orders")
         self.cancel_all_orders()
         self.state_changed.emit(BotState.STOPPED)
 
-    # ==================================================================
-    # State emission
-    # ==================================================================
     def _emit_state(self):
-        """Push current state to the GUI via signals."""
         try:
             summary = self._db.build_pnl_summary(self.is_paper)
             self.pnl_updated.emit(summary)

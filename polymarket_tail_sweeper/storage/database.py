@@ -36,6 +36,7 @@ class Database:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._create_tables()
+        self._migrate()
 
     # ------------------------------------------------------------------
     # Schema
@@ -82,7 +83,8 @@ class Database:
                     status TEXT DEFAULT 'OPEN',
                     post_only INTEGER DEFAULT 0,
                     created_at TEXT,
-                    is_paper INTEGER DEFAULT 1
+                    is_paper INTEGER DEFAULT 1,
+                    order_tag TEXT DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS trades (
@@ -119,6 +121,14 @@ class Database:
                 );
             """)
             c.commit()
+
+    def _migrate(self):
+        """Backward-compatible column additions for existing databases."""
+        with self._lock:
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(open_orders)").fetchall()}
+            if "order_tag" not in cols:
+                self._conn.execute("ALTER TABLE open_orders ADD COLUMN order_tag TEXT DEFAULT ''")
+                self._conn.commit()
 
     def close(self):
         with self._lock:
@@ -200,6 +210,15 @@ class Database:
             ).fetchall()
         return [self._row_to_position(r) for r in rows]
 
+    def get_all_position_token_ids(self, is_paper: bool = True) -> List[str]:
+        """Return token_ids of all positions with shares > 0."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT token_id FROM positions WHERE is_paper=? AND shares > 0",
+                (int(is_paper),),
+            ).fetchall()
+        return [r["token_id"] for r in rows]
+
     def get_position_by_token(self, token_id: str, is_paper: bool = True) -> Optional[Position]:
         with self._lock:
             row = self._conn.execute(
@@ -223,6 +242,15 @@ class Database:
                 (int(is_paper),),
             )
             self._conn.commit()
+
+    def count_positions_for_condition(self, condition_id: str, is_paper: bool = True) -> int:
+        """Count open positions (shares > 0) belonging to a given market condition."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) as cnt FROM positions WHERE condition_id=? AND is_paper=? AND shares > 0",
+                (condition_id, int(is_paper)),
+            ).fetchone()
+        return row["cnt"] if row else 0
 
     @staticmethod
     def _row_to_position(r) -> Position:
@@ -248,14 +276,14 @@ class Database:
                 INSERT OR REPLACE INTO open_orders
                     (order_id, token_id, condition_id, market_question,
                      side, price, size, remaining_size, status,
-                     post_only, created_at, is_paper)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     post_only, created_at, is_paper, order_tag)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
             """, (
                 order.order_id, order.token_id, order.condition_id,
                 order.market_question, order.side, order.price,
                 order.size, order.remaining_size, order.status,
                 int(order.post_only), order.created_at or _now(),
-                int(order.is_paper),
+                int(order.is_paper), order.order_tag or "",
             ))
             self._conn.commit()
             return cur.lastrowid
@@ -297,6 +325,15 @@ class Database:
             )
             self._conn.commit()
 
+    def cancel_open_sells_for_token(self, token_id: str, is_paper: bool = True):
+        """Cancel all open SELL orders for a specific token."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE open_orders SET status='CANCELLED' WHERE token_id=? AND side='SELL' AND status='OPEN' AND is_paper=?",
+                (token_id, int(is_paper)),
+            )
+            self._conn.commit()
+
     def get_stale_orders(self, timeout_sec: int, is_paper: bool = True) -> List[OpenOrder]:
         with self._lock:
             rows = self._conn.execute("""
@@ -314,8 +351,21 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def get_order_tag(self, order_id: str) -> str:
+        """Return the order_tag for a given order, or empty string."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT order_tag FROM open_orders WHERE order_id=?", (order_id,)
+            ).fetchone()
+        return (row["order_tag"] or "") if row else ""
+
     @staticmethod
     def _row_to_order(r) -> OpenOrder:
+        tag = ""
+        try:
+            tag = r["order_tag"] or ""
+        except (IndexError, KeyError):
+            pass
         return OpenOrder(
             id=r["id"], order_id=r["order_id"],
             token_id=r["token_id"], condition_id=r["condition_id"],
@@ -324,6 +374,7 @@ class Database:
             remaining_size=r["remaining_size"], status=r["status"],
             post_only=bool(r["post_only"]),
             created_at=r["created_at"], is_paper=bool(r["is_paper"]),
+            order_tag=tag,
         )
 
     # ------------------------------------------------------------------
@@ -353,6 +404,16 @@ class Database:
                 (int(is_paper), limit),
             ).fetchall()
         return [self._row_to_trade(r) for r in rows]
+
+    def get_recent_profitable_tokens(self, hours: int, is_paper: bool = True) -> List[str]:
+        """Return token_ids that had profitable sells in the last N hours."""
+        with self._lock:
+            rows = self._conn.execute("""
+                SELECT DISTINCT token_id FROM trades
+                WHERE action='SELL' AND realized_pnl > 0 AND is_paper=?
+                AND datetime(timestamp) > datetime('now', ? || ' hours')
+            """, (int(is_paper), str(-hours))).fetchall()
+        return [r["token_id"] for r in rows]
 
     def count_trades_today(self, action: str, is_paper: bool = True) -> int:
         with self._lock:
