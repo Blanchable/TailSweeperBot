@@ -405,19 +405,91 @@ class BotWorker(QThread):
 
                 # Guard: skip exit if there's already an open SELL for this token
                 if self._db.has_open_order_for_token(pos.token_id, "SELL", self.is_paper):
+                    logger.debug(
+                        "Exit skipped: existing open sell order for %s",
+                        pos.token_id[:12],
+                    )
+                    continue
+
+                best_bid = book.best_bid
+                best_ask = book.best_ask
+                mid = book.midpoint
+
+                # Choose the trigger price based on configured mode
+                if self._settings.exit_trigger_mode == "midpoint" and mid is not None:
+                    trigger_price = mid
+                else:
+                    trigger_price = best_bid
+
+                if trigger_price is None or trigger_price <= 0:
                     continue
 
                 triggers = self._pnl.check_exit_rungs(
                     refreshed,
                     self._settings.exit_multiples,
                     self._settings.exit_fractions,
+                    trigger_price=trigger_price,
                 )
-                if triggers:
-                    # Only attempt the *first* un-triggered rung per cycle.
-                    rung_idx, fraction, sell_shares = triggers[0]
-                    sell_price = book.best_bid if book.best_bid else refreshed.current_mark
-                    if sell_price and sell_price > 0 and sell_shares > 0:
-                        self._place_sell(refreshed, sell_price, sell_shares, rung_idx, book)
+
+                if not triggers:
+                    continue
+
+                rung_idx, fraction, sell_shares = triggers[0]
+                rung_multiple = self._settings.exit_multiples[rung_idx]
+                target_price = refreshed.avg_entry * rung_multiple
+                min_exit = refreshed.avg_entry + self._settings.min_exit_profit_buffer
+
+                logger.info(
+                    "Exit eval: token=%s mkt=%s avg=%.4f bid=%s ask=%s mid=%s "
+                    "rung=%d multiple=%.2f target=%.4f trigger=%.4f min_exit=%.4f",
+                    pos.token_id[:12],
+                    (refreshed.market_question or "")[:40],
+                    refreshed.avg_entry,
+                    f"{best_bid:.4f}" if best_bid else "None",
+                    f"{best_ask:.4f}" if best_ask else "None",
+                    f"{mid:.4f}" if mid else "None",
+                    rung_idx,
+                    rung_multiple,
+                    target_price,
+                    trigger_price,
+                    min_exit,
+                )
+
+                # No-loss guard: never auto-sell below breakeven + buffer
+                if best_bid is None or best_bid < min_exit:
+                    logger.info(
+                        "Exit blocked: executable bid (%.4f) below breakeven+buffer "
+                        "(%.4f) for %s (avg_entry=%.4f, buffer=%.4f)",
+                        best_bid or 0.0,
+                        min_exit,
+                        pos.token_id[:12],
+                        refreshed.avg_entry,
+                        self._settings.min_exit_profit_buffer,
+                    )
+                    continue
+
+                # Choose order price based on exit_order_mode
+                if self._settings.exit_order_mode == "passive":
+                    if mid is not None and mid > best_bid:
+                        sell_price = mid
+                    else:
+                        sell_price = best_bid
+                    # Even in passive mode, never price below breakeven
+                    if sell_price < min_exit:
+                        sell_price = min_exit
+                    logger.info(
+                        "Exit deferred: passive sell posted at %.4f (bid=%.4f) for %s",
+                        sell_price, best_bid, pos.token_id[:12],
+                    )
+                else:
+                    sell_price = best_bid
+                    logger.info(
+                        "Exit placed: aggressive sell at bid %.4f for %s",
+                        sell_price, pos.token_id[:12],
+                    )
+
+                if sell_price > 0 and sell_shares > 0:
+                    self._place_sell(refreshed, sell_price, sell_shares, rung_idx, book)
 
             except Exception as exc:
                 logger.error("Error monitoring %s: %s", pos.token_id[:12], exc)

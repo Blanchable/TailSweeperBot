@@ -44,6 +44,11 @@ class Settings:
     exit_multiples: List[float] = field(default_factory=lambda: [3.0, 5.0, 10.0])
     exit_fractions: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.25])
 
+    # exit safety
+    exit_trigger_mode: str = "best_bid"    # "best_bid" or "midpoint"
+    exit_order_mode: str = "aggressive"    # "aggressive" (sell at bid) or "passive" (sell above bid)
+    min_exit_profit_buffer: float = 0.0001 # min edge above avg_entry before auto-sell is allowed
+
     # filters
     only_fee_free: bool = False
     skip_neg_risk: bool = True
@@ -88,7 +93,7 @@ class Settings:
         ]
         float_fields = [
             "max_entry_price", "min_spread", "per_order_usd",
-            "max_total_exposure",
+            "max_total_exposure", "min_exit_profit_buffer",
         ]
         for k in bool_fields:
             if k in d and not isinstance(d[k], bool):

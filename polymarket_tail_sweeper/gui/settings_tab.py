@@ -114,6 +114,23 @@ class SettingsTab(QWidget):
         self.edit_exit_fractions = QLineEdit()
         exit_layout.addWidget(self.edit_exit_fractions, 1, 1)
 
+        exit_layout.addWidget(QLabel("Exit trigger mode:"), 2, 0)
+        self.combo_exit_trigger = QComboBox()
+        self.combo_exit_trigger.addItems(["best_bid", "midpoint"])
+        exit_layout.addWidget(self.combo_exit_trigger, 2, 1)
+
+        exit_layout.addWidget(QLabel("Exit order mode:"), 3, 0)
+        self.combo_exit_order = QComboBox()
+        self.combo_exit_order.addItems(["aggressive", "passive"])
+        exit_layout.addWidget(self.combo_exit_order, 3, 1)
+
+        exit_layout.addWidget(QLabel("Min exit profit buffer ($):"), 4, 0)
+        self.spin_exit_buffer = QDoubleSpinBox()
+        self.spin_exit_buffer.setRange(0.0, 0.10)
+        self.spin_exit_buffer.setDecimals(4)
+        self.spin_exit_buffer.setSingleStep(0.0001)
+        exit_layout.addWidget(self.spin_exit_buffer, 4, 1)
+
         main_layout.addWidget(exit_group)
 
         # --- Filters ---
@@ -207,6 +224,11 @@ class SettingsTab(QWidget):
         self.spin_max_buys.setValue(s.max_buys_per_cycle)
         self.edit_exit_multiples.setText(json.dumps(s.exit_multiples))
         self.edit_exit_fractions.setText(json.dumps(s.exit_fractions))
+        idx_trigger = self.combo_exit_trigger.findText(s.exit_trigger_mode)
+        self.combo_exit_trigger.setCurrentIndex(max(0, idx_trigger))
+        idx_order = self.combo_exit_order.findText(s.exit_order_mode)
+        self.combo_exit_order.setCurrentIndex(max(0, idx_order))
+        self.spin_exit_buffer.setValue(s.min_exit_profit_buffer)
         self.chk_fee_free.setChecked(s.only_fee_free)
         self.chk_neg_risk.setChecked(s.skip_neg_risk)
         self.chk_post_only.setChecked(s.use_post_only)
@@ -239,6 +261,9 @@ class SettingsTab(QWidget):
         except (json.JSONDecodeError, TypeError):
             s.exit_fractions = [0.25, 0.25, 0.25]
 
+        s.exit_trigger_mode = self.combo_exit_trigger.currentText()
+        s.exit_order_mode = self.combo_exit_order.currentText()
+        s.min_exit_profit_buffer = self.spin_exit_buffer.value()
         s.only_fee_free = self.chk_fee_free.isChecked()
         s.skip_neg_risk = self.chk_neg_risk.isChecked()
         s.use_post_only = self.chk_post_only.isChecked()

@@ -128,17 +128,35 @@ class PnLEngine:
 
         self._db.upsert_position(pos)
 
-    def check_exit_rungs(self, pos: Position, exit_multiples: list, exit_fractions: list) -> list:
+    def check_exit_rungs(
+        self,
+        pos: Position,
+        exit_multiples: list,
+        exit_fractions: list,
+        trigger_price: Optional[float] = None,
+    ) -> list:
         """
         Check which exit rungs have been reached.
         Returns list of (rung_index, fraction, shares_to_sell) tuples.
+
+        trigger_price: the executable price to evaluate against.
+        When None, falls back to pos.current_bid (then pos.current_mark).
+        Callers should pass best_bid so exits are based on executable price.
         """
         triggers = []
         if pos.avg_entry <= 0 or pos.shares <= 0:
             return triggers
 
-        mark = pos.current_mark if pos.current_mark > 0 else pos.avg_entry
-        multiple = mark / pos.avg_entry
+        if trigger_price is not None and trigger_price > 0:
+            price = trigger_price
+        elif pos.current_bid > 0:
+            price = pos.current_bid
+        elif pos.current_mark > 0:
+            price = pos.current_mark
+        else:
+            price = pos.avg_entry
+
+        multiple = price / pos.avg_entry
 
         for i in range(pos.next_exit_rung, len(exit_multiples)):
             if multiple >= exit_multiples[i]:
