@@ -322,6 +322,45 @@ class LiveTradingAdapter:
             logger.error("Failed to fetch balances: %s", exc)
             return {}
 
+    def get_wallet_positions(self) -> Dict[str, float]:
+        """
+        Fetch actual current outcome-token balances for the live wallet.
+        Returns {token_id: shares_held}.
+
+        Uses the Gamma API positions endpoint as the primary source.
+        Falls back to empty dict on failure — the caller should treat
+        a failed fetch as "unknown" rather than "definitely empty".
+        """
+        if not self.is_ready:
+            return {}
+        funder = self._settings.funder_address
+        if not funder:
+            return {}
+        try:
+            import requests
+            from config import POLYMARKET_GAMMA_BASE
+            resp = requests.get(
+                f"{POLYMARKET_GAMMA_BASE}/positions",
+                params={"user": funder},
+                timeout=15,
+            )
+            if resp.status_code != 200:
+                logger.warning("Wallet positions fetch returned %d", resp.status_code)
+                return {}
+            data = resp.json()
+            holdings: Dict[str, float] = {}
+            if isinstance(data, list):
+                for item in data:
+                    tid = item.get("asset") or item.get("token_id") or item.get("tokenId") or ""
+                    size = _safe_float(item.get("size") or item.get("balance") or item.get("shares"), 0.0)
+                    if tid and size > 0:
+                        holdings[tid] = holdings.get(tid, 0.0) + size
+            logger.info("Wallet positions fetched: %d tokens held", len(holdings))
+            return holdings
+        except Exception as exc:
+            logger.error("Failed to fetch wallet positions: %s", exc)
+            return {}
+
 
 # ---------------------------------------------------------------------------
 # Paper trading adapter

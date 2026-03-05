@@ -1,10 +1,11 @@
 """
 Strategy: filters markets, scores candidates, decides entries and exits.
+Includes liquidity quality filters and market-memory scoring.
 """
 from __future__ import annotations
 
 import logging
-from typing import List
+from typing import List, Set
 
 from config import Settings
 from models.data_models import Market, Token, OrderBook, Candidate
@@ -13,10 +14,20 @@ logger = logging.getLogger("tailsweeper.strategy")
 
 
 class Strategy:
-    """Tail-sweep entry/exit strategy logic."""
+    """Tail-sweep / micro-scalp entry/exit strategy logic."""
 
     def __init__(self, settings: Settings):
         self.s = settings
+        self._recent_winners: Set[str] = set()
+        self._position_condition_counts: dict = {}
+
+    def set_recent_winners(self, token_ids: Set[str]):
+        """Update the set of recently profitable token_ids for score boosting."""
+        self._recent_winners = token_ids
+
+    def set_position_condition_counts(self, counts: dict):
+        """Update {condition_id: position_count} for exposure capping."""
+        self._position_condition_counts = counts
 
     def filter_markets(self, markets: List[Market]) -> List[Market]:
         """Apply market-level filters. Returns passing markets."""
@@ -44,9 +55,16 @@ class Strategy:
         held_tokens: set,
         open_buy_tokens: set,
     ) -> List[Candidate]:
-        """
-        For a given market, find tokens that qualify as buy candidates.
-        """
+        """Find tokens that qualify as buy candidates with liquidity quality checks."""
+        # Market-level exposure cap
+        cap = self.s.same_market_exposure_cap
+        if cap > 0:
+            existing = self._position_condition_counts.get(market.condition_id, 0)
+            if existing >= cap:
+                logger.debug("Skip market %s (exposure cap %d/%d)",
+                             market.question[:40], existing, cap)
+                return []
+
         candidates = []
         for token in market.tokens:
             book: OrderBook = books.get(token.token_id)
@@ -68,29 +86,44 @@ class Strategy:
                 continue
 
             if best_ask > self.s.max_entry_price:
-                logger.debug(
-                    "Skip %s ask=%.4f > max_entry=%.4f",
-                    token.token_id[:12], best_ask, self.s.max_entry_price,
-                )
+                logger.debug("Skip %s ask=%.4f > max=%.4f",
+                             token.token_id[:12], best_ask, self.s.max_entry_price)
                 continue
 
             if best_ask <= 0:
                 continue
 
+            # --- Liquidity quality filters ---
+            if best_bid is None:
+                logger.debug("Skip %s (no bids — one-sided book)", token.token_id[:12])
+                continue
+
+            bid_size = book.best_bid_size
+            ask_size = book.best_ask_size
+
+            if bid_size < self.s.min_best_bid_size:
+                logger.debug("Skip %s bid_size=%.1f < min=%.1f",
+                             token.token_id[:12], bid_size, self.s.min_best_bid_size)
+                continue
+
+            if ask_size < self.s.min_best_ask_size:
+                logger.debug("Skip %s ask_size=%.1f < min=%.1f",
+                             token.token_id[:12], ask_size, self.s.min_best_ask_size)
+                continue
+
             spread = book.spread
             if spread is None or spread < self.s.min_spread:
-                logger.debug(
-                    "Skip %s spread=%.4f < min=%.4f",
-                    token.token_id[:12], spread or 0, self.s.min_spread,
-                )
+                logger.debug("Skip %s spread=%.4f < min=%.4f",
+                             token.token_id[:12], spread or 0, self.s.min_spread)
                 continue
 
-            ask_size = book.best_ask_size
-            if ask_size < 1.0:
-                logger.debug("Skip %s (ask size too small: %.2f)", token.token_id[:12], ask_size)
+            spread_ratio = spread / best_ask if best_ask > 0 else 1.0
+            if spread_ratio > self.s.max_spread_ratio:
+                logger.debug("Skip %s spread_ratio=%.2f > max=%.2f",
+                             token.token_id[:12], spread_ratio, self.s.max_spread_ratio)
                 continue
 
-            score = self._score_candidate(book, best_ask, spread)
+            score = self._score_candidate(book, best_ask, spread, token.token_id)
 
             candidates.append(Candidate(
                 market=market,
@@ -99,26 +132,35 @@ class Strategy:
                 score=score,
                 ask_price=best_ask,
                 ask_size=ask_size,
-                bid_price=best_bid or 0.0,
+                bid_price=best_bid,
                 spread=spread or 0.0,
             ))
 
         return candidates
 
-    def _score_candidate(self, book: OrderBook, ask: float, spread: float) -> float:
+    def _score_candidate(
+        self, book: OrderBook, ask: float, spread: float, token_id: str = ""
+    ) -> float:
         """
-        Simple inefficiency score.
+        Composite inefficiency + liquidity score.
         Higher = more attractive.
-        Factors:
-         - wider spread / ask ratio
-         - lower ask price
-         - lower displayed depth (easier to be first in queue)
         """
         spread_ratio = spread / ask if ask > 0 else 0
-        price_score = max(0, 1.0 - (ask / 0.01))  # cheaper is better, scaled to 1c
+        price_score = max(0, 1.0 - (ask / 0.01))
         depth_penalty = min(1.0, 100.0 / max(book.best_ask_size, 1.0))
 
-        return (spread_ratio * 40) + (price_score * 40) + (depth_penalty * 20)
+        base = (spread_ratio * 30) + (price_score * 30) + (depth_penalty * 15)
+
+        # Bid-side quality bonus: real two-sided books score higher
+        if book.best_bid_size > 0:
+            bid_quality = min(1.0, book.best_bid_size / 50.0)
+            base += bid_quality * 15
+
+        # Recent winner boost
+        if token_id in self._recent_winners:
+            base += 10.0
+
+        return base
 
     def rank_candidates(self, candidates: List[Candidate]) -> List[Candidate]:
         """Sort candidates by score descending."""
@@ -137,10 +179,7 @@ class Strategy:
         current_positions: int,
         buys_this_cycle: int,
     ) -> bool:
-        """
-        Pre-flight checks before placing a buy.
-        committed_capital = total_exposure + cash_reserved + in-cycle reserved.
-        """
+        """Pre-flight checks before placing a buy."""
         if committed_capital >= self.s.max_total_exposure:
             logger.debug("Committed capital cap: %.2f >= %.2f",
                          committed_capital, self.s.max_total_exposure)

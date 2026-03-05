@@ -33,21 +33,21 @@ class Settings:
 
     # scan
     scan_interval_sec: int = 60
-    max_entry_price: float = 0.005  # $0.005 = 0.5 cents
+    max_entry_price: float = 0.005
     min_spread: float = 0.001
     per_order_usd: float = 1.0
     max_total_exposure: float = 50.0
     max_positions: int = 50
     max_buys_per_cycle: int = 3
 
-    # exit ladder (parallel lists)
+    # exit ladder
     exit_multiples: List[float] = field(default_factory=lambda: [3.0, 5.0, 10.0])
     exit_fractions: List[float] = field(default_factory=lambda: [0.25, 0.25, 0.25])
 
     # exit safety
-    exit_trigger_mode: str = "best_bid"    # "best_bid" or "midpoint"
-    exit_order_mode: str = "aggressive"    # "aggressive" (sell at bid) or "passive" (sell above bid)
-    min_exit_profit_buffer: float = 0.0001 # min edge above avg_entry before auto-sell is allowed
+    exit_trigger_mode: str = "best_bid"
+    exit_order_mode: str = "aggressive"
+    min_exit_profit_buffer: float = 0.0001
 
     # filters
     only_fee_free: bool = False
@@ -61,10 +61,34 @@ class Settings:
     # market refresh
     market_refresh_interval_sec: int = 300
 
+    # live account sync
+    live_sync_on_start: bool = True
+    live_sync_when_idle: bool = True
+
+    # strategy / liquidity filters
+    min_best_bid_size: float = 5.0
+    min_best_ask_size: float = 5.0
+    max_spread_ratio: float = 0.90
+
+    # market memory
+    recent_winner_boost_hours: int = 24
+    same_market_exposure_cap: int = 3
+
+    # inventory management
+    max_hold_minutes: int = 1440
+    no_progress_minutes: int = 120
+    breakeven_unwind_minutes: int = 720
+    allow_small_forced_unwind_loss: bool = False
+
+    # entry maintenance
+    entry_reprice_enabled: bool = False
+    entry_reprice_interval_sec: int = 120
+    entry_max_reprices: int = 2
+
     # credentials (live mode)
     private_key: str = ""
     funder_address: str = ""
-    signature_type: int = 0  # 0 = EOA, 1 = POLY_GNOSIS_SAFE, 2 = POLY_PROXY
+    signature_type: int = 0
 
     # paths
     db_path: str = DB_PATH_DEFAULT
@@ -85,15 +109,22 @@ class Settings:
         bool_fields = [
             "paper_mode", "only_fee_free", "skip_neg_risk",
             "use_post_only", "auto_cancel_on_stop",
+            "live_sync_on_start", "live_sync_when_idle",
+            "allow_small_forced_unwind_loss", "entry_reprice_enabled",
         ]
         int_fields = [
             "scan_interval_sec", "max_positions", "max_buys_per_cycle",
             "stale_order_timeout_sec", "signature_type",
             "market_refresh_interval_sec",
+            "recent_winner_boost_hours", "same_market_exposure_cap",
+            "max_hold_minutes", "no_progress_minutes",
+            "breakeven_unwind_minutes",
+            "entry_reprice_interval_sec", "entry_max_reprices",
         ]
         float_fields = [
             "max_entry_price", "min_spread", "per_order_usd",
             "max_total_exposure", "min_exit_profit_buffer",
+            "min_best_bid_size", "min_best_ask_size", "max_spread_ratio",
         ]
         for k in bool_fields:
             if k in d and not isinstance(d[k], bool):

@@ -148,6 +148,7 @@ class OpenOrder:
     post_only: bool = False
     created_at: str = ""
     is_paper: bool = True
+    order_tag: str = ""  # EXIT_RUNG:N, SELL_ALL, ENTRY, etc.
 
 
 @dataclass

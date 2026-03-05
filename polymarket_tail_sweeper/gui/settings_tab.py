@@ -18,7 +18,7 @@ from config import Settings
 class SettingsTab(QWidget):
     """Settings editor tab."""
 
-    settings_saved = Signal(object)  # emits Settings
+    settings_saved = Signal(object)
 
     def __init__(self, settings: Settings, parent=None):
         super().__init__(parent)
@@ -133,6 +133,94 @@ class SettingsTab(QWidget):
 
         main_layout.addWidget(exit_group)
 
+        # --- Liquidity Filters ---
+        liq_group = QGroupBox("Liquidity Quality Filters")
+        liq_layout = QGridLayout(liq_group)
+        liq_layout.setSpacing(8)
+
+        liq_layout.addWidget(QLabel("Min best bid size:"), 0, 0)
+        self.spin_min_bid_size = QDoubleSpinBox()
+        self.spin_min_bid_size.setRange(0.0, 1000.0)
+        self.spin_min_bid_size.setDecimals(1)
+        liq_layout.addWidget(self.spin_min_bid_size, 0, 1)
+
+        liq_layout.addWidget(QLabel("Min best ask size:"), 1, 0)
+        self.spin_min_ask_size = QDoubleSpinBox()
+        self.spin_min_ask_size.setRange(0.0, 1000.0)
+        self.spin_min_ask_size.setDecimals(1)
+        liq_layout.addWidget(self.spin_min_ask_size, 1, 1)
+
+        liq_layout.addWidget(QLabel("Max spread ratio:"), 2, 0)
+        self.spin_max_spread_ratio = QDoubleSpinBox()
+        self.spin_max_spread_ratio.setRange(0.01, 1.0)
+        self.spin_max_spread_ratio.setDecimals(2)
+        self.spin_max_spread_ratio.setSingleStep(0.05)
+        liq_layout.addWidget(self.spin_max_spread_ratio, 2, 1)
+
+        main_layout.addWidget(liq_group)
+
+        # --- Market Memory ---
+        mem_group = QGroupBox("Market Memory")
+        mem_layout = QGridLayout(mem_group)
+        mem_layout.setSpacing(8)
+
+        mem_layout.addWidget(QLabel("Recent winner boost (hours):"), 0, 0)
+        self.spin_winner_hours = QSpinBox()
+        self.spin_winner_hours.setRange(1, 168)
+        mem_layout.addWidget(self.spin_winner_hours, 0, 1)
+
+        mem_layout.addWidget(QLabel("Same market exposure cap:"), 1, 0)
+        self.spin_market_cap = QSpinBox()
+        self.spin_market_cap.setRange(0, 50)
+        mem_layout.addWidget(self.spin_market_cap, 1, 1)
+
+        main_layout.addWidget(mem_group)
+
+        # --- Inventory Management ---
+        inv_group = QGroupBox("Inventory Management")
+        inv_layout = QGridLayout(inv_group)
+        inv_layout.setSpacing(8)
+
+        inv_layout.addWidget(QLabel("Max hold (min):"), 0, 0)
+        self.spin_max_hold = QSpinBox()
+        self.spin_max_hold.setRange(0, 14400)
+        inv_layout.addWidget(self.spin_max_hold, 0, 1)
+
+        inv_layout.addWidget(QLabel("No-progress (min):"), 1, 0)
+        self.spin_no_progress = QSpinBox()
+        self.spin_no_progress.setRange(0, 14400)
+        inv_layout.addWidget(self.spin_no_progress, 1, 1)
+
+        inv_layout.addWidget(QLabel("Breakeven unwind (min):"), 2, 0)
+        self.spin_be_unwind = QSpinBox()
+        self.spin_be_unwind.setRange(0, 14400)
+        inv_layout.addWidget(self.spin_be_unwind, 2, 1)
+
+        self.chk_forced_loss = QCheckBox("Allow small forced unwind loss")
+        inv_layout.addWidget(self.chk_forced_loss, 3, 0, 1, 2)
+
+        main_layout.addWidget(inv_group)
+
+        # --- Entry Maintenance ---
+        entry_group = QGroupBox("Entry Order Maintenance")
+        entry_layout = QGridLayout(entry_group)
+        entry_layout.setSpacing(8)
+
+        self.chk_reprice = QCheckBox("Enable entry repricing")
+        entry_layout.addWidget(self.chk_reprice, 0, 0, 1, 2)
+
+        entry_layout.addWidget(QLabel("Reprice interval (sec):"), 1, 0)
+        self.spin_reprice_interval = QSpinBox()
+        self.spin_reprice_interval.setRange(30, 3600)
+        entry_layout.addWidget(self.spin_reprice_interval, 1, 1)
+
+        entry_layout.addWidget(QLabel("Max reprices:"), 2, 0)
+        self.spin_max_reprices = QSpinBox()
+        self.spin_max_reprices.setRange(0, 20)
+        entry_layout.addWidget(self.spin_max_reprices, 2, 1)
+
+        main_layout.addWidget(entry_group)
+
         # --- Filters ---
         filter_group = QGroupBox("Market Filters")
         filter_layout = QVBoxLayout(filter_group)
@@ -160,6 +248,11 @@ class SettingsTab(QWidget):
         self.spin_market_refresh = QSpinBox()
         self.spin_market_refresh.setRange(60, 3600)
         order_layout.addWidget(self.spin_market_refresh, 2, 1)
+
+        self.chk_sync_start = QCheckBox("Live sync on start")
+        order_layout.addWidget(self.chk_sync_start, 3, 0, 1, 2)
+        self.chk_sync_idle = QCheckBox("Live sync when idle")
+        order_layout.addWidget(self.chk_sync_idle, 4, 0, 1, 2)
 
         main_layout.addWidget(order_group)
 
@@ -229,19 +322,32 @@ class SettingsTab(QWidget):
         idx_order = self.combo_exit_order.findText(s.exit_order_mode)
         self.combo_exit_order.setCurrentIndex(max(0, idx_order))
         self.spin_exit_buffer.setValue(s.min_exit_profit_buffer)
+        self.spin_min_bid_size.setValue(s.min_best_bid_size)
+        self.spin_min_ask_size.setValue(s.min_best_ask_size)
+        self.spin_max_spread_ratio.setValue(s.max_spread_ratio)
+        self.spin_winner_hours.setValue(s.recent_winner_boost_hours)
+        self.spin_market_cap.setValue(s.same_market_exposure_cap)
+        self.spin_max_hold.setValue(s.max_hold_minutes)
+        self.spin_no_progress.setValue(s.no_progress_minutes)
+        self.spin_be_unwind.setValue(s.breakeven_unwind_minutes)
+        self.chk_forced_loss.setChecked(s.allow_small_forced_unwind_loss)
+        self.chk_reprice.setChecked(s.entry_reprice_enabled)
+        self.spin_reprice_interval.setValue(s.entry_reprice_interval_sec)
+        self.spin_max_reprices.setValue(s.entry_max_reprices)
         self.chk_fee_free.setChecked(s.only_fee_free)
         self.chk_neg_risk.setChecked(s.skip_neg_risk)
         self.chk_post_only.setChecked(s.use_post_only)
         self.spin_stale_timeout.setValue(s.stale_order_timeout_sec)
         self.chk_auto_cancel.setChecked(s.auto_cancel_on_stop)
         self.spin_market_refresh.setValue(s.market_refresh_interval_sec)
+        self.chk_sync_start.setChecked(s.live_sync_on_start)
+        self.chk_sync_idle.setChecked(s.live_sync_when_idle)
         self.edit_private_key.setText(s.private_key)
         self.edit_funder.setText(s.funder_address)
         self.combo_sig_type.setCurrentIndex(s.signature_type)
         self.edit_db_path.setText(s.db_path)
 
     def collect_settings(self) -> Settings:
-        """Read all GUI values into a Settings object."""
         s = Settings()
         s.paper_mode = self.chk_paper.isChecked()
         s.scan_interval_sec = self.spin_scan_interval.value()
@@ -264,12 +370,26 @@ class SettingsTab(QWidget):
         s.exit_trigger_mode = self.combo_exit_trigger.currentText()
         s.exit_order_mode = self.combo_exit_order.currentText()
         s.min_exit_profit_buffer = self.spin_exit_buffer.value()
+        s.min_best_bid_size = self.spin_min_bid_size.value()
+        s.min_best_ask_size = self.spin_min_ask_size.value()
+        s.max_spread_ratio = self.spin_max_spread_ratio.value()
+        s.recent_winner_boost_hours = self.spin_winner_hours.value()
+        s.same_market_exposure_cap = self.spin_market_cap.value()
+        s.max_hold_minutes = self.spin_max_hold.value()
+        s.no_progress_minutes = self.spin_no_progress.value()
+        s.breakeven_unwind_minutes = self.spin_be_unwind.value()
+        s.allow_small_forced_unwind_loss = self.chk_forced_loss.isChecked()
+        s.entry_reprice_enabled = self.chk_reprice.isChecked()
+        s.entry_reprice_interval_sec = self.spin_reprice_interval.value()
+        s.entry_max_reprices = self.spin_max_reprices.value()
         s.only_fee_free = self.chk_fee_free.isChecked()
         s.skip_neg_risk = self.chk_neg_risk.isChecked()
         s.use_post_only = self.chk_post_only.isChecked()
         s.stale_order_timeout_sec = self.spin_stale_timeout.value()
         s.auto_cancel_on_stop = self.chk_auto_cancel.isChecked()
         s.market_refresh_interval_sec = self.spin_market_refresh.value()
+        s.live_sync_on_start = self.chk_sync_start.isChecked()
+        s.live_sync_when_idle = self.chk_sync_idle.isChecked()
         s.private_key = self.edit_private_key.text().strip()
         s.funder_address = self.edit_funder.text().strip()
         s.signature_type = self.combo_sig_type.currentIndex()

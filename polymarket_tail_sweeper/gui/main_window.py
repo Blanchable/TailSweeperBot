@@ -93,12 +93,26 @@ class MainWindow(QMainWindow):
         self.btn_reload = QPushButton("Reload Markets")
         self.btn_reload.setEnabled(False)
         self.btn_cancel_all = QPushButton("Cancel All Orders")
+        self.btn_sell_all = QPushButton("Sell All at Market")
+        self.btn_sell_all.setObjectName("sellAllBtn")
+        self.btn_sell_all.setStyleSheet("""
+            QPushButton#sellAllBtn {
+                background-color: #6e3a0a;
+                border-color: #8a4a1a;
+                color: #ffffff;
+                font-weight: bold;
+            }
+            QPushButton#sellAllBtn:hover {
+                background-color: #8a4a1a;
+            }
+        """)
         self.btn_kill = QPushButton("KILL SWITCH")
         self.btn_kill.setObjectName("killBtn")
         self.btn_kill.setEnabled(False)
 
         for btn in [self.btn_start, self.btn_stop, self.btn_save,
-                     self.btn_reload, self.btn_cancel_all, self.btn_kill]:
+                     self.btn_reload, self.btn_cancel_all,
+                     self.btn_sell_all, self.btn_kill]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
 
@@ -154,18 +168,17 @@ class MainWindow(QMainWindow):
         self.btn_save.clicked.connect(self._on_save_settings)
         self.btn_reload.clicked.connect(self._on_reload_markets)
         self.btn_cancel_all.clicked.connect(self._on_cancel_all)
+        self.btn_sell_all.clicked.connect(self._on_sell_all_market)
         self.btn_kill.clicked.connect(self._on_kill_switch)
         self.settings_tab.settings_saved.connect(self._on_settings_changed)
 
     @staticmethod
     def _mask_address(addr: str) -> str:
-        """Return a safe masked version of a hex address for display."""
         if not addr or len(addr) < 10:
             return ""
         return f"{addr[:6]}...{addr[-4:]}"
 
     def _refresh_wallet_indicator(self):
-        """Update the Wallet status indicator and log credential state."""
         has_key = bool(self._settings.private_key)
         has_funder = bool(self._settings.funder_address)
 
@@ -181,22 +194,31 @@ class MainWindow(QMainWindow):
             self.ind_wallet.set_status("Not set", "gray")
             logger.info("Live credentials not set")
 
+    # ------------------------------------------------------------------
+    # Centralized DB refresh
+    # ------------------------------------------------------------------
+    def _refresh_from_db(self):
+        """Reload all tables and dashboard from the current DB state."""
+        is_paper = self._settings.paper_mode
+        try:
+            self.positions_table.load_data(self._db.get_positions(is_paper))
+            self.orders_table.load_data(self._db.get_open_orders(is_paper))
+            self.trades_table.load_data(self._db.get_trades(is_paper, 200))
+            summary = self._db.build_pnl_summary(is_paper)
+            self.dashboard.update_summary(summary)
+        except Exception:
+            pass
+
     def _load_persisted_state(self):
         """Load data from DB on startup."""
-        is_paper = self._settings.paper_mode
-        self.positions_table.load_data(self._db.get_positions(is_paper))
-        self.orders_table.load_data(self._db.get_open_orders(is_paper))
-        self.trades_table.load_data(self._db.get_trades(is_paper, 200))
+        self._refresh_from_db()
 
         events = self._db.get_events(limit=200)
         self.event_log_table.load_data(events)
 
-        summary = self._db.build_pnl_summary(is_paper)
-        self.dashboard.update_summary(summary)
-
         self.ind_bot.set_status("Stopped", "gray")
         self._refresh_wallet_indicator()
-        mode_text = "Paper" if is_paper else "Live"
+        mode_text = "Paper" if self._settings.paper_mode else "Live"
         self._status_bar.showMessage(f"Ready — {mode_text} mode")
 
     # ------------------------------------------------------------------
@@ -276,10 +298,45 @@ class MainWindow(QMainWindow):
             self._worker.cancel_all_orders()
         else:
             self._db.cancel_all_open_orders(self._settings.paper_mode)
-            self.orders_table.load_data(
-                self._db.get_open_orders(self._settings.paper_mode)
-            )
+        self._refresh_from_db()
         self._status_bar.showMessage("All open orders cancelled")
+
+    @Slot()
+    def _on_sell_all_market(self):
+        """Emergency liquidation of all held positions at market price."""
+        positions = self._db.get_positions(self._settings.paper_mode)
+        if not positions:
+            QMessageBox.information(self, "Sell All", "No open positions to liquidate.")
+            return
+
+        confirm = QMessageBox.warning(
+            self, "Sell All at Market",
+            f"This will attempt to liquidate ALL {len(positions)} held positions "
+            f"at the current best executable bid.\n\n"
+            f"Mode: {'PAPER' if self._settings.paper_mode else 'LIVE'}\n\n"
+            f"Proceed?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        self._status_bar.showMessage("Selling all positions at market...")
+        logger.warning("User triggered Sell All at Market")
+
+        if self._worker and self._worker.isRunning():
+            self._worker.sell_all_at_market()
+        else:
+            temp_worker = BotWorker(self._settings, self._db)
+            if not self._settings.paper_mode:
+                if not temp_worker._init_live_trading():
+                    QMessageBox.warning(self, "Error",
+                                        "Failed to initialize live adapter for sell-all.")
+                    return
+            temp_worker._running = True
+            temp_worker.sell_all_at_market()
+
+        self._refresh_from_db()
+        self._status_bar.showMessage("Sell-all complete — check positions and trades")
 
     @Slot()
     def _on_save_settings(self):
@@ -318,6 +375,7 @@ class MainWindow(QMainWindow):
         self.btn_kill.setEnabled(False)
         self.btn_reload.setEnabled(False)
         self.ind_bot.set_status("Stopped", "gray")
+        self._refresh_from_db()
         self._status_bar.showMessage("Bot stopped")
 
     @Slot(object)
@@ -363,19 +421,14 @@ class MainWindow(QMainWindow):
         self._status_bar.showMessage(f"Error: {msg}")
 
     def _on_log_message(self, timestamp: str, level: str, message: str):
-        """Receives log messages and routes to event log table."""
         self.event_log_table.add_entry(timestamp, level, message)
         self._db.insert_event(level, message)
 
     def _periodic_refresh(self):
-        """Refresh dashboard even when bot is idle (for positions still held)."""
+        """Refresh all tables and dashboard when the bot is idle."""
         if self._worker and self._worker.isRunning():
             return
-        try:
-            summary = self._db.build_pnl_summary(self._settings.paper_mode)
-            self.dashboard.update_summary(summary)
-        except Exception:
-            pass
+        self._refresh_from_db()
 
     # ------------------------------------------------------------------
     # Window close
