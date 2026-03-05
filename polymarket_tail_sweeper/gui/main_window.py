@@ -157,6 +157,30 @@ class MainWindow(QMainWindow):
         self.btn_kill.clicked.connect(self._on_kill_switch)
         self.settings_tab.settings_saved.connect(self._on_settings_changed)
 
+    @staticmethod
+    def _mask_address(addr: str) -> str:
+        """Return a safe masked version of a hex address for display."""
+        if not addr or len(addr) < 10:
+            return ""
+        return f"{addr[:6]}...{addr[-4:]}"
+
+    def _refresh_wallet_indicator(self):
+        """Update the Wallet status indicator and log credential state."""
+        has_key = bool(self._settings.private_key)
+        has_funder = bool(self._settings.funder_address)
+
+        if has_key and has_funder:
+            masked = self._mask_address(self._settings.funder_address)
+            self.ind_wallet.set_status(f"Loaded ({masked})", "green")
+            logger.info("Live credentials loaded: private key and funder address present")
+        elif has_key or has_funder:
+            missing = "funder address" if not has_funder else "private key"
+            self.ind_wallet.set_status("Incomplete", "yellow")
+            logger.info("Live credentials incomplete: missing %s", missing)
+        else:
+            self.ind_wallet.set_status("Not set", "gray")
+            logger.info("Live credentials not set")
+
     def _load_persisted_state(self):
         """Load data from DB on startup."""
         is_paper = self._settings.paper_mode
@@ -171,11 +195,8 @@ class MainWindow(QMainWindow):
         self.dashboard.update_summary(summary)
 
         self.ind_bot.set_status("Stopped", "gray")
+        self._refresh_wallet_indicator()
         mode_text = "Paper" if is_paper else "Live"
-        self.ind_wallet.set_status(
-            "Loaded" if self._settings.private_key else "Not set",
-            "green" if self._settings.private_key else "gray",
-        )
         self._status_bar.showMessage(f"Ready — {mode_text} mode")
 
     # ------------------------------------------------------------------
@@ -266,6 +287,7 @@ class MainWindow(QMainWindow):
         self._db.save_settings(self._settings)
         if self._worker and self._worker.isRunning():
             self._worker.update_settings(self._settings)
+        self._refresh_wallet_indicator()
         self._status_bar.showMessage("Settings saved")
         logger.info("Settings saved to database")
 

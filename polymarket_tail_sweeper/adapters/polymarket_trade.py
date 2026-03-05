@@ -77,6 +77,27 @@ class LiveTradingAdapter:
     # ------------------------------------------------------------------
     # Order placement with tick normalization + real post-only
     # ------------------------------------------------------------------
+    def _post_order_compat(self, signed_order, order_type_value):
+        """
+        Submit a signed order to the CLOB via the SDK, handling keyword
+        argument differences across py-clob-client versions.
+
+        The SDK's post_order() uses camelCase ``orderType`` (not snake_case
+        ``order_type``).  We call with the correct keyword and surface a
+        clear adapter-level message if the SDK shape changes again.
+        """
+        try:
+            return self._client.post_order(signed_order, orderType=order_type_value)
+        except TypeError as exc:
+            msg = str(exc)
+            if "orderType" in msg or "order_type" in msg or "unexpected keyword" in msg:
+                logger.error(
+                    "py-clob-client API appears incompatible with this adapter. "
+                    "post_order() rejected our keyword argument. SDK error: %s",
+                    msg,
+                )
+            raise
+
     def place_limit_order(
         self,
         token_id: str,
@@ -123,11 +144,7 @@ class LiveTradingAdapter:
             )
 
             signed_order = self._client.create_order(order_args)
-
-            # py-clob-client >=0.5 supports OrderType.GTC / GTD / FOK.
-            # There is no native post-only flag in the SDK; our safety is
-            # enforced by the normalize_price layer above.
-            resp = self._client.post_order(signed_order, order_type=OrderType.GTC)
+            resp = self._post_order_compat(signed_order, OrderType.GTC)
 
             order_id = None
             if isinstance(resp, dict):
