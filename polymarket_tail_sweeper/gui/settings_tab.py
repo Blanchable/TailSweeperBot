@@ -59,7 +59,7 @@ class SettingsTab(QWidget):
         row += 1
         scan_layout.addWidget(QLabel("Max entry price ($):"), row, 0)
         self.spin_max_entry = QDoubleSpinBox()
-        self.spin_max_entry.setRange(0.0001, 0.10)
+        self.spin_max_entry.setRange(0.001, 0.10)
         self.spin_max_entry.setDecimals(4)
         self.spin_max_entry.setSingleStep(0.001)
         scan_layout.addWidget(self.spin_max_entry, row, 1)
@@ -98,6 +98,14 @@ class SettingsTab(QWidget):
         self.spin_max_buys = QSpinBox()
         self.spin_max_buys.setRange(1, 50)
         scan_layout.addWidget(self.spin_max_buys, row, 1)
+
+        row += 1
+        scan_layout.addWidget(QLabel("Min marketable order ($):"), row, 0)
+        self.spin_min_marketable = QDoubleSpinBox()
+        self.spin_min_marketable.setRange(0.10, 10.0)
+        self.spin_min_marketable.setDecimals(2)
+        self.spin_min_marketable.setSingleStep(0.10)
+        scan_layout.addWidget(self.spin_min_marketable, row, 1)
 
         main_layout.addWidget(scan_group)
 
@@ -211,7 +219,7 @@ class SettingsTab(QWidget):
 
         entry_layout.addWidget(QLabel("Reprice interval (sec):"), 1, 0)
         self.spin_reprice_interval = QSpinBox()
-        self.spin_reprice_interval.setRange(30, 3600)
+        self.spin_reprice_interval.setRange(5, 3600)
         entry_layout.addWidget(self.spin_reprice_interval, 1, 1)
 
         entry_layout.addWidget(QLabel("Max reprices:"), 2, 0)
@@ -274,7 +282,7 @@ class SettingsTab(QWidget):
 
         cred_layout.addWidget(QLabel("Signature type:"), 2, 0)
         self.combo_sig_type = QComboBox()
-        self.combo_sig_type.addItems(["0 - EOA", "1 - POLY_GNOSIS_SAFE", "2 - POLY_PROXY"])
+        self.combo_sig_type.addItems(["0 - EOA", "1 - POLY_PROXY", "2 - POLY_GNOSIS_SAFE"])
         cred_layout.addWidget(self.combo_sig_type, 2, 1)
 
         note = QLabel("Credentials are stored in memory only. Use .env for persistent storage.")
@@ -315,6 +323,7 @@ class SettingsTab(QWidget):
         self.spin_max_exposure.setValue(s.max_total_exposure)
         self.spin_max_positions.setValue(s.max_positions)
         self.spin_max_buys.setValue(s.max_buys_per_cycle)
+        self.spin_min_marketable.setValue(s.min_marketable_order_usd)
         self.edit_exit_multiples.setText(json.dumps(s.exit_multiples))
         self.edit_exit_fractions.setText(json.dumps(s.exit_fractions))
         idx_trigger = self.combo_exit_trigger.findText(s.exit_trigger_mode)
@@ -357,6 +366,7 @@ class SettingsTab(QWidget):
         s.max_total_exposure = self.spin_max_exposure.value()
         s.max_positions = self.spin_max_positions.value()
         s.max_buys_per_cycle = self.spin_max_buys.value()
+        s.min_marketable_order_usd = self.spin_min_marketable.value()
 
         try:
             s.exit_multiples = json.loads(self.edit_exit_multiples.text())
