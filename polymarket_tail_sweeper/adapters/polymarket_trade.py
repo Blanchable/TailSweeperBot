@@ -130,6 +130,31 @@ class LiveTradingAdapter:
             )
             return None
 
+        # Marketable min-size guard: the CLOB rejects marketable orders
+        # below $1.  If this order would cross the spread, enforce the min.
+        is_marketable = False
+        if side.upper() == "BUY" and best_ask is not None and safe_price >= best_ask:
+            is_marketable = True
+        elif side.upper() == "SELL" and best_bid is not None and safe_price <= best_bid:
+            is_marketable = True
+
+        if is_marketable:
+            order_usd = safe_price * size
+            min_usd = self._settings.min_marketable_order_usd
+            if order_usd < min_usd:
+                needed_size = min_usd / safe_price if safe_price > 0 else 0
+                if needed_size > size * 1.5:
+                    logger.warning(
+                        "Skipped marketable %s order: $%.2f < min $%.2f for %s",
+                        side, order_usd, min_usd, token_id[:12],
+                    )
+                    return None
+                logger.info(
+                    "Bumped marketable %s size %.2f->%.2f for %s (min $%.2f)",
+                    side, size, needed_size, token_id[:12], min_usd,
+                )
+                size = round(needed_size, 2)
+
         try:
             from py_clob_client.clob_types import OrderArgs, OrderType
             from py_clob_client.order_builder.constants import BUY, SELL
@@ -327,39 +352,104 @@ class LiveTradingAdapter:
         Fetch actual current outcome-token balances for the live wallet.
         Returns {token_id: shares_held}.
 
-        Uses the Gamma API positions endpoint as the primary source.
-        Falls back to empty dict on failure — the caller should treat
-        a failed fetch as "unknown" rather than "definitely empty".
+        Uses the Polymarket Data API (data-api.polymarket.com/positions)
+        with pagination and sizeThreshold=0 so even tiny positions appear.
+
+        For POLY_PROXY signature types, the funder address may differ from
+        the actual proxy wallet.  If the initial fetch returns empty, we
+        attempt to resolve the proxy wallet via the Gamma public-profile
+        endpoint and retry.
         """
         if not self.is_ready:
             return {}
         funder = self._settings.funder_address
         if not funder:
             return {}
-        try:
-            import requests
-            from config import POLYMARKET_GAMMA_BASE
-            resp = requests.get(
-                f"{POLYMARKET_GAMMA_BASE}/positions",
-                params={"user": funder},
-                timeout=15,
-            )
-            if resp.status_code != 200:
-                logger.warning("Wallet positions fetch returned %d", resp.status_code)
-                return {}
-            data = resp.json()
-            holdings: Dict[str, float] = {}
-            if isinstance(data, list):
-                for item in data:
-                    tid = item.get("asset") or item.get("token_id") or item.get("tokenId") or ""
-                    size = _safe_float(item.get("size") or item.get("balance") or item.get("shares"), 0.0)
+
+        holdings = self._fetch_positions_data_api(funder)
+
+        # Proxy-wallet fallback: if empty and using POLY_PROXY, resolve actual proxy
+        if not holdings and self._settings.signature_type == 1:
+            proxy = self._resolve_proxy_wallet(funder)
+            if proxy and proxy.lower() != funder.lower():
+                logger.info("Wallet sync: retrying with proxy wallet %s...%s",
+                            proxy[:6], proxy[-4:])
+                holdings = self._fetch_positions_data_api(proxy)
+
+        logger.info("Wallet positions fetched: %d tokens held (addr=%s...%s)",
+                     len(holdings), funder[:6], funder[-4:])
+        return holdings
+
+    def _fetch_positions_data_api(self, address: str) -> Dict[str, float]:
+        """Paginated fetch from the Data API positions endpoint."""
+        import requests
+        holdings: Dict[str, float] = {}
+        offset = 0
+        page_size = 500
+        data_api = "https://data-api.polymarket.com"
+
+        while True:
+            try:
+                resp = requests.get(
+                    f"{data_api}/positions",
+                    params={
+                        "user": address,
+                        "sizeThreshold": "0",
+                        "limit": str(page_size),
+                        "offset": str(offset),
+                    },
+                    timeout=15,
+                )
+                if resp.status_code != 200:
+                    logger.warning("Data API positions returned %d for %s...%s",
+                                   resp.status_code, address[:6], address[-4:])
+                    break
+                data = resp.json()
+                if not data:
+                    break
+
+                items = data if isinstance(data, list) else data.get("positions", data.get("data", []))
+                if not isinstance(items, list) or not items:
+                    break
+
+                for item in items:
+                    tid = (item.get("asset") or item.get("token_id")
+                           or item.get("tokenId") or item.get("assetId") or "")
+                    size = _safe_float(
+                        item.get("size") or item.get("balance")
+                        or item.get("shares") or item.get("amount"), 0.0
+                    )
                     if tid and size > 0:
                         holdings[tid] = holdings.get(tid, 0.0) + size
-            logger.info("Wallet positions fetched: %d tokens held", len(holdings))
-            return holdings
+
+                if len(items) < page_size:
+                    break
+                offset += page_size
+            except Exception as exc:
+                logger.error("Data API positions fetch error: %s", exc)
+                break
+
+        return holdings
+
+    @staticmethod
+    def _resolve_proxy_wallet(funder: str) -> Optional[str]:
+        """Look up the proxy wallet address via Gamma public-profile."""
+        import requests
+        from config import POLYMARKET_GAMMA_BASE
+        try:
+            resp = requests.get(
+                f"{POLYMARKET_GAMMA_BASE}/public-profile",
+                params={"address": funder},
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                proxy = data.get("proxyWallet") or data.get("proxy_wallet") or ""
+                if proxy:
+                    return proxy
         except Exception as exc:
-            logger.error("Failed to fetch wallet positions: %s", exc)
-            return {}
+            logger.debug("Proxy wallet lookup failed: %s", exc)
+        return None
 
 
 # ---------------------------------------------------------------------------

@@ -106,13 +106,14 @@ class MainWindow(QMainWindow):
                 background-color: #8a4a1a;
             }
         """)
+        self.btn_sync = QPushButton("Sync Portfolio")
         self.btn_kill = QPushButton("KILL SWITCH")
         self.btn_kill.setObjectName("killBtn")
         self.btn_kill.setEnabled(False)
 
         for btn in [self.btn_start, self.btn_stop, self.btn_save,
                      self.btn_reload, self.btn_cancel_all,
-                     self.btn_sell_all, self.btn_kill]:
+                     self.btn_sell_all, self.btn_sync, self.btn_kill]:
             toolbar.addWidget(btn)
         toolbar.addStretch()
 
@@ -169,6 +170,7 @@ class MainWindow(QMainWindow):
         self.btn_reload.clicked.connect(self._on_reload_markets)
         self.btn_cancel_all.clicked.connect(self._on_cancel_all)
         self.btn_sell_all.clicked.connect(self._on_sell_all_market)
+        self.btn_sync.clicked.connect(self._on_sync_portfolio)
         self.btn_kill.clicked.connect(self._on_kill_switch)
         self.settings_tab.settings_saved.connect(self._on_settings_changed)
 
@@ -337,6 +339,35 @@ class MainWindow(QMainWindow):
 
         self._refresh_from_db()
         self._status_bar.showMessage("Sell-all complete — check positions and trades")
+
+    @Slot()
+    def _on_sync_portfolio(self):
+        """Run live account sync to reconcile DB against actual wallet/exchange state."""
+        if self._settings.paper_mode:
+            QMessageBox.information(self, "Sync", "Sync is only available in live mode.")
+            return
+
+        errors = self._settings.validate_live_mode()
+        if errors:
+            QMessageBox.warning(self, "Sync", "Cannot sync:\n\n" + "\n".join(errors))
+            return
+
+        self._status_bar.showMessage("Syncing portfolio with exchange...")
+        logger.info("User triggered Sync Portfolio")
+
+        if self._worker and self._worker.isRunning():
+            self._worker._sync_live_account_state()
+        else:
+            temp_worker = BotWorker(self._settings, self._db)
+            if not temp_worker._init_live_trading():
+                QMessageBox.warning(self, "Error",
+                                    "Failed to initialize live adapter for sync.")
+                return
+            temp_worker._running = True
+            temp_worker._sync_live_account_state()
+
+        self._refresh_from_db()
+        self._status_bar.showMessage("Portfolio sync complete")
 
     @Slot()
     def _on_save_settings(self):

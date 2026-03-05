@@ -123,6 +123,19 @@ class Strategy:
                              token.token_id[:12], spread_ratio, self.s.max_spread_ratio)
                 continue
 
+            # Banded rules: higher-priced entries require stronger liquidity
+            if best_ask > 0.01:
+                min_depth = max(self.s.min_best_bid_size, 50.0)
+                max_ratio = min(self.s.max_spread_ratio, 0.35)
+                if bid_size < min_depth or ask_size < min_depth:
+                    logger.debug("Skip %s (banded: depth %.0f/%.0f < %.0f for ask>1c)",
+                                 token.token_id[:12], bid_size, ask_size, min_depth)
+                    continue
+                if spread_ratio > max_ratio:
+                    logger.debug("Skip %s (banded: ratio %.2f > %.2f for ask>1c)",
+                                 token.token_id[:12], spread_ratio, max_ratio)
+                    continue
+
             score = self._score_candidate(book, best_ask, spread, token.token_id)
 
             candidates.append(Candidate(
@@ -146,19 +159,20 @@ class Strategy:
         Higher = more attractive.
         """
         spread_ratio = spread / ask if ask > 0 else 0
-        price_score = max(0, 1.0 - (ask / 0.01))
-        depth_penalty = min(1.0, 100.0 / max(book.best_ask_size, 1.0))
+        price_score = max(0, 1.0 - (ask / 0.04))
+        depth_bonus = min(1.0, min(book.best_bid_size, book.best_ask_size) / 100.0)
+        tightness = max(0, 1.0 - spread_ratio)
 
-        base = (spread_ratio * 30) + (price_score * 30) + (depth_penalty * 15)
+        base = (tightness * 25) + (price_score * 20) + (depth_bonus * 25)
 
-        # Bid-side quality bonus: real two-sided books score higher
+        # Bid-side quality bonus
         if book.best_bid_size > 0:
-            bid_quality = min(1.0, book.best_bid_size / 50.0)
-            base += bid_quality * 15
+            bid_quality = min(1.0, book.best_bid_size / 100.0)
+            base += bid_quality * 10
 
         # Recent winner boost
         if token_id in self._recent_winners:
-            base += 10.0
+            base += 20.0
 
         return base
 
@@ -196,7 +210,7 @@ class Strategy:
         """Reject obviously bad prices."""
         if price <= 0:
             return False
-        if price > 0.05:
-            logger.warning("Price guard: %.4f exceeds hard cap $0.05", price)
+        if price > 0.10:
+            logger.warning("Price guard: %.4f exceeds hard cap $0.10", price)
             return False
         return True

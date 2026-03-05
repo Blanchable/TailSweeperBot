@@ -33,7 +33,7 @@ class Settings:
 
     # scan
     scan_interval_sec: int = 60
-    max_entry_price: float = 0.005
+    max_entry_price: float = 0.035
     min_spread: float = 0.001
     per_order_usd: float = 1.0
     max_total_exposure: float = 50.0
@@ -47,7 +47,7 @@ class Settings:
     # exit safety
     exit_trigger_mode: str = "best_bid"
     exit_order_mode: str = "aggressive"
-    min_exit_profit_buffer: float = 0.0001
+    min_exit_profit_buffer: float = 0.0005
 
     # filters
     only_fee_free: bool = False
@@ -66,24 +66,27 @@ class Settings:
     live_sync_when_idle: bool = True
 
     # strategy / liquidity filters
-    min_best_bid_size: float = 5.0
-    min_best_ask_size: float = 5.0
-    max_spread_ratio: float = 0.90
+    min_best_bid_size: float = 25.0
+    min_best_ask_size: float = 25.0
+    max_spread_ratio: float = 0.50
 
     # market memory
-    recent_winner_boost_hours: int = 24
-    same_market_exposure_cap: int = 3
+    recent_winner_boost_hours: int = 12
+    same_market_exposure_cap: int = 2
 
     # inventory management
-    max_hold_minutes: int = 1440
-    no_progress_minutes: int = 120
-    breakeven_unwind_minutes: int = 720
+    max_hold_minutes: int = 180
+    no_progress_minutes: int = 20
+    breakeven_unwind_minutes: int = 45
     allow_small_forced_unwind_loss: bool = False
 
+    # order size
+    min_marketable_order_usd: float = 1.0
+
     # entry maintenance
-    entry_reprice_enabled: bool = False
-    entry_reprice_interval_sec: int = 120
-    entry_max_reprices: int = 2
+    entry_reprice_enabled: bool = True
+    entry_reprice_interval_sec: int = 15
+    entry_max_reprices: int = 6
 
     # credentials (live mode)
     private_key: str = ""
@@ -125,6 +128,7 @@ class Settings:
             "max_entry_price", "min_spread", "per_order_usd",
             "max_total_exposure", "min_exit_profit_buffer",
             "min_best_bid_size", "min_best_ask_size", "max_spread_ratio",
+            "min_marketable_order_usd",
         ]
         for k in bool_fields:
             if k in d and not isinstance(d[k], bool):
