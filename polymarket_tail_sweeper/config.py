@@ -53,6 +53,9 @@ class Settings:
     stale_order_timeout_sec: int = 600
     auto_cancel_on_stop: bool = True
 
+    # market refresh
+    market_refresh_interval_sec: int = 300
+
     # credentials (live mode)
     private_key: str = ""
     funder_address: str = ""
@@ -81,6 +84,7 @@ class Settings:
         int_fields = [
             "scan_interval_sec", "max_positions", "max_buys_per_cycle",
             "stale_order_timeout_sec", "signature_type",
+            "market_refresh_interval_sec",
         ]
         float_fields = [
             "max_entry_price", "min_spread", "per_order_usd",
