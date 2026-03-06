@@ -20,6 +20,7 @@ class Strategy:
         self.s = settings
         self._recent_winners: Set[str] = set()
         self._position_condition_counts: dict = {}
+        self._farm_tokens: Set[str] = set()
 
     def set_recent_winners(self, token_ids: Set[str]):
         """Update the set of recently profitable token_ids for score boosting."""
@@ -28,6 +29,10 @@ class Strategy:
     def set_position_condition_counts(self, counts: dict):
         """Update {condition_id: position_count} for exposure capping."""
         self._position_condition_counts = counts
+
+    def set_farm_tokens(self, token_ids: Set[str]):
+        """Update the set of tokens currently in the farm list."""
+        self._farm_tokens = token_ids
 
     def filter_markets(self, markets: List[Market]) -> List[Market]:
         """Apply market-level filters. Returns passing markets."""
@@ -173,6 +178,10 @@ class Strategy:
         # Recent winner boost
         if token_id in self._recent_winners:
             base += 20.0
+
+        # Farm token boost (large, pushes farm tokens to top of ranking)
+        if token_id in self._farm_tokens:
+            base += self.s.farm_score_boost
 
         return base
 

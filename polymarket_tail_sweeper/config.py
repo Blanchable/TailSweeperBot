@@ -83,6 +83,19 @@ class Settings:
     # order size
     min_marketable_order_usd: float = 1.0
 
+    # scan / farm mode
+    scan_burst_duration_sec: int = 90
+    scan_burst_max_new_orders: int = 6
+    farm_phase_max_minutes: int = 25
+    rescan_every_minutes: int = 45
+    rescan_if_farm_size_below: int = 6
+    rescan_fill_window_minutes: int = 10
+    rescan_if_fill_rate_below: int = 1
+    farm_token_ttl_minutes: int = 240
+    farm_prune_after_bad_cycles: int = 10
+    farm_boost_hours: int = 12
+    farm_score_boost: float = 1000.0
+
     # entry maintenance
     entry_reprice_enabled: bool = True
     entry_reprice_interval_sec: int = 15
@@ -122,13 +135,18 @@ class Settings:
             "recent_winner_boost_hours", "same_market_exposure_cap",
             "max_hold_minutes", "no_progress_minutes",
             "breakeven_unwind_minutes",
+            "scan_burst_duration_sec", "scan_burst_max_new_orders",
+            "farm_phase_max_minutes", "rescan_every_minutes",
+            "rescan_if_farm_size_below", "rescan_fill_window_minutes",
+            "rescan_if_fill_rate_below", "farm_token_ttl_minutes",
+            "farm_prune_after_bad_cycles", "farm_boost_hours",
             "entry_reprice_interval_sec", "entry_max_reprices",
         ]
         float_fields = [
             "max_entry_price", "min_spread", "per_order_usd",
             "max_total_exposure", "min_exit_profit_buffer",
             "min_best_bid_size", "min_best_ask_size", "max_spread_ratio",
-            "min_marketable_order_usd",
+            "min_marketable_order_usd", "farm_score_boost",
         ]
         for k in bool_fields:
             if k in d and not isinstance(d[k], bool):
